@@ -1,0 +1,762 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'WebSocket API Gateway for Real-time Bitcoin Predictions'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: 'production'
+    AllowedValues: ['development', 'staging', 'production']
+    Description: Deployment environment
+  
+  LambdaSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security group for Lambda functions
+  
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnet IDs for Lambda functions
+
+Resources:
+  # WebSocket API
+  WebSocketApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub 'bitcoin-websocket-api-${Environment}'
+      Description: 'Real-time WebSocket API for Bitcoin predictions'
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: '$request.body.action'
+      Tags:
+        Environment: !Ref Environment
+        Component: WebSocketAPI
+
+  # Lambda Functions for WebSocket Handlers
+  ConnectFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'bitcoin-websocket-connect-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      MemorySize: 256
+      Timeout: 30
+      Role: !GetAtt WebSocketLambdaRole.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroupId
+        SubnetIds: !Ref SubnetIds
+      Environment:
+        Variables:
+          CONNECTIONS_TABLE: !Ref ConnectionsTable
+          REDIS_ENDPOINT: !GetAtt RedisCluster.RedisEndpoint.Address
+          REDIS_PORT: !GetAtt RedisCluster.RedisEndpoint.Port
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import redis
+          import os
+          from datetime import datetime, timezone
+
+          dynamodb = boto3.resource('dynamodb')
+          connections_table = dynamodb.Table(os.environ['CONNECTIONS_TABLE'])
+
+          redis_client = redis.Redis(
+              host=os.environ['REDIS_ENDPOINT'],
+              port=int(os.environ['REDIS_PORT']),
+              decode_responses=True
+          )
+
+          def lambda_handler(event, context):
+              connection_id = event['requestContext']['connectionId']
+              domain_name = event['requestContext']['domainName']
+              stage = event['requestContext']['stage']
+              
+              try:
+                  # Store connection in DynamoDB
+                  connections_table.put_item(
+                      Item={
+                          'connectionId': connection_id,
+                          'connectedAt': datetime.now(timezone.utc).isoformat(),
+                          'domain': domain_name,
+                          'stage': stage,
+                          'subscriptions': ['price', 'predictions'],  # Default subscriptions
+                          'ttl': int(datetime.now(timezone.utc).timestamp()) + 86400  # 24 hours TTL
+                      }
+                  )
+                  
+                  # Add to Redis for fast lookups
+                  redis_client.sadd('active_connections', connection_id)
+                  redis_client.expire('active_connections', 86400)
+                  
+                  # Send welcome message
+                  apigateway = boto3.client('apigatewaymanagementapi',
+                      endpoint_url=f'https://{domain_name}/{stage}'
+                  )
+                  
+                  welcome_message = {
+                      'type': 'connection_established',
+                      'connectionId': connection_id,
+                      'timestamp': datetime.now(timezone.utc).isoformat(),
+                      'subscriptions': ['price', 'predictions']
+                  }
+                  
+                  apigateway.post_to_connection(
+                      ConnectionId=connection_id,
+                      Data=json.dumps(welcome_message)
+                  )
+                  
+                  return {'statusCode': 200}
+                  
+              except Exception as e:
+                  print(f"Connection error: {str(e)}")
+                  return {'statusCode': 500}
+
+  DisconnectFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'bitcoin-websocket-disconnect-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Timeout: 30
+      Role: !GetAtt WebSocketLambdaRole.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroupId
+        SubnetIds: !Ref SubnetIds
+      Environment:
+        Variables:
+          CONNECTIONS_TABLE: !Ref ConnectionsTable
+          REDIS_ENDPOINT: !GetAtt RedisCluster.RedisEndpoint.Address
+          REDIS_PORT: !GetAtt RedisCluster.RedisEndpoint.Port
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import redis
+          import os
+
+          dynamodb = boto3.resource('dynamodb')
+          connections_table = dynamodb.Table(os.environ['CONNECTIONS_TABLE'])
+
+          redis_client = redis.Redis(
+              host=os.environ['REDIS_ENDPOINT'],
+              port=int(os.environ['REDIS_PORT']),
+              decode_responses=True
+          )
+
+          def lambda_handler(event, context):
+              connection_id = event['requestContext']['connectionId']
+              
+              try:
+                  # Remove from DynamoDB
+                  connections_table.delete_item(
+                      Key={'connectionId': connection_id}
+                  )
+                  
+                  # Remove from Redis
+                  redis_client.srem('active_connections', connection_id)
+                  
+                  return {'statusCode': 200}
+                  
+              except Exception as e:
+                  print(f"Disconnect error: {str(e)}")
+                  return {'statusCode': 500}
+
+  MessageFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'bitcoin-websocket-message-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      MemorySize: 512
+      Timeout: 60
+      Role: !GetAtt WebSocketLambdaRole.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroupId
+        SubnetIds: !Ref SubnetIds
+      Environment:
+        Variables:
+          CONNECTIONS_TABLE: !Ref ConnectionsTable
+          REDIS_ENDPOINT: !GetAtt RedisCluster.RedisEndpoint.Address
+          REDIS_PORT: !GetAtt RedisCluster.RedisEndpoint.Port
+          ENSEMBLE_ENDPOINT: !Sub '{{resolve:ssm:/bitcoin/sagemaker/ensemble-endpoint-${Environment}}}'
+          DEEPLEARNING_ENDPOINT: !Sub '{{resolve:ssm:/bitcoin/sagemaker/deeplearning-endpoint-${Environment}}}'
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import redis
+          import os
+          from datetime import datetime, timezone
+
+          dynamodb = boto3.resource('dynamodb')
+          sagemaker = boto3.client('sagemaker-runtime')
+          connections_table = dynamodb.Table(os.environ['CONNECTIONS_TABLE'])
+
+          redis_client = redis.Redis(
+              host=os.environ['REDIS_ENDPOINT'],
+              port=int(os.environ['REDIS_PORT']),
+              decode_responses=True
+          )
+
+          def lambda_handler(event, context):
+              connection_id = event['requestContext']['connectionId']
+              domain_name = event['requestContext']['domainName']
+              stage = event['requestContext']['stage']
+              
+              apigateway = boto3.client('apigatewaymanagementapi',
+                  endpoint_url=f'https://{domain_name}/{stage}'
+              )
+              
+              try:
+                  body = json.loads(event['body'])
+                  action = body.get('action', 'default')
+                  
+                  if action == 'subscribe':
+                      return handle_subscription(connection_id, body, apigateway)
+                  elif action == 'unsubscribe':
+                      return handle_unsubscription(connection_id, body, apigateway)
+                  elif action == 'get_prediction':
+                      return handle_prediction_request(connection_id, body, apigateway)
+                  elif action == 'get_history':
+                      return handle_history_request(connection_id, body, apigateway)
+                  else:
+                      return send_error(connection_id, 'Unknown action', apigateway)
+                      
+              except Exception as e:
+                  print(f"Message handling error: {str(e)}")
+                  return send_error(connection_id, str(e), apigateway)
+
+          def handle_subscription(connection_id, body, apigateway):
+              subscriptions = body.get('subscriptions', [])
+              
+              # Update connection subscriptions
+              connections_table.update_item(
+                  Key={'connectionId': connection_id},
+                  UpdateExpression='SET subscriptions = :subs',
+                  ExpressionAttributeValues={':subs': subscriptions}
+              )
+              
+              response = {
+                  'type': 'subscription_updated',
+                  'subscriptions': subscriptions,
+                  'timestamp': datetime.now(timezone.utc).isoformat()
+              }
+              
+              apigateway.post_to_connection(
+                  ConnectionId=connection_id,
+                  Data=json.dumps(response)
+              )
+              
+              return {'statusCode': 200}
+
+          def handle_prediction_request(connection_id, body, apigateway):
+              # Get real-time prediction from SageMaker
+              try:
+                  # Check cache first
+                  cached_prediction = redis_client.get('latest_prediction')
+                  if cached_prediction:
+                      prediction_data = json.loads(cached_prediction)
+                  else:
+                      # Call SageMaker ensemble endpoint
+                      response = sagemaker.invoke_endpoint(
+                          EndpointName=os.environ['ENSEMBLE_ENDPOINT'],
+                          ContentType='application/json',
+                          Body=json.dumps({
+                              'instances': [get_latest_features()]
+                          })
+                      )
+                      
+                      prediction_data = json.loads(response['Body'].read())
+                      
+                      # Cache for 30 seconds
+                      redis_client.setex('latest_prediction', 30, json.dumps(prediction_data))
+                  
+                  response_data = {
+                      'type': 'prediction',
+                      'data': prediction_data,
+                      'timestamp': datetime.now(timezone.utc).isoformat()
+                  }
+                  
+                  apigateway.post_to_connection(
+                      ConnectionId=connection_id,
+                      Data=json.dumps(response_data)
+                  )
+                  
+                  return {'statusCode': 200}
+                  
+              except Exception as e:
+                  return send_error(connection_id, f"Prediction error: {str(e)}", apigateway)
+
+          def get_latest_features():
+              # Get latest features from Redis cache or Kinesis
+              try:
+                  features = redis_client.get('latest_features')
+                  if features:
+                      return json.loads(features)
+                  else:
+                      # Fallback to default features
+                      return {
+                          'price': 45000.0,
+                          'volume': 1000000.0,
+                          'sentiment': 0.1,
+                          'volatility': 0.05
+                      }
+              except:
+                  return {
+                      'price': 45000.0,
+                      'volume': 1000000.0,
+                      'sentiment': 0.0,
+                      'volatility': 0.05
+                  }
+
+          def send_error(connection_id, error_message, apigateway):
+              error_response = {
+                  'type': 'error',
+                  'message': error_message,
+                  'timestamp': datetime.now(timezone.utc).isoformat()
+              }
+              
+              try:
+                  apigateway.post_to_connection(
+                      ConnectionId=connection_id,
+                      Data=json.dumps(error_response)
+                  )
+              except:
+                  pass
+                  
+              return {'statusCode': 400}
+
+  # Broadcast Function for sending updates to all connected clients
+  BroadcastFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'bitcoin-websocket-broadcast-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      MemorySize: 1024
+      Timeout: 300
+      Role: !GetAtt WebSocketLambdaRole.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroupId
+        SubnetIds: !Ref SubnetIds
+      Environment:
+        Variables:
+          CONNECTIONS_TABLE: !Ref ConnectionsTable
+          WEBSOCKET_API_ENDPOINT: !Sub 'https://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/${WebSocketStage}'
+          REDIS_ENDPOINT: !GetAtt RedisCluster.RedisEndpoint.Address
+          REDIS_PORT: !GetAtt RedisCluster.RedisEndpoint.Port
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import redis
+          import os
+          from datetime import datetime, timezone
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+
+          dynamodb = boto3.resource('dynamodb')
+          connections_table = dynamodb.Table(os.environ['CONNECTIONS_TABLE'])
+
+          redis_client = redis.Redis(
+              host=os.environ['REDIS_ENDPOINT'],
+              port=int(os.environ['REDIS_PORT']),
+              decode_responses=True
+          )
+
+          def lambda_handler(event, context):
+              # This function is triggered by Kinesis/EventBridge with new predictions
+              try:
+                  message_type = event.get('messageType', 'prediction')
+                  data = event.get('data', {})
+                  
+                  if message_type == 'price_update':
+                      return broadcast_price_update(data)
+                  elif message_type == 'prediction_update':
+                      return broadcast_prediction_update(data)
+                  elif message_type == 'alert':
+                      return broadcast_alert(data)
+                  
+                  return {'statusCode': 200}
+                  
+              except Exception as e:
+                  print(f"Broadcast error: {str(e)}")
+                  return {'statusCode': 500}
+
+          def broadcast_price_update(price_data):
+              message = {
+                  'type': 'price_update',
+                  'data': price_data,
+                  'timestamp': datetime.now(timezone.utc).isoformat()
+              }
+              
+              return send_to_subscribers(message, 'price')
+
+          def broadcast_prediction_update(prediction_data):
+              message = {
+                  'type': 'prediction_update',
+                  'data': prediction_data,
+                  'timestamp': datetime.now(timezone.utc).isoformat()
+              }
+              
+              return send_to_subscribers(message, 'predictions')
+
+          def broadcast_alert(alert_data):
+              message = {
+                  'type': 'alert',
+                  'data': alert_data,
+                  'timestamp': datetime.now(timezone.utc).isoformat()
+              }
+              
+              return send_to_subscribers(message, 'alerts')
+
+          def send_to_subscribers(message, subscription_type):
+              # Get all connections subscribed to this type
+              response = connections_table.scan(
+                  FilterExpression='contains(subscriptions, :sub_type)',
+                  ExpressionAttributeValues={':sub_type': subscription_type}
+              )
+              
+              connections = response['Items']
+              
+              if not connections:
+                  return {'statusCode': 200, 'sent': 0}
+              
+              # Use ThreadPoolExecutor for parallel sending
+              with ThreadPoolExecutor(max_workers=50) as executor:
+                  futures = []
+                  for connection in connections:
+                      future = executor.submit(send_message, connection, message)
+                      futures.append(future)
+                  
+                  sent_count = 0
+                  failed_count = 0
+                  
+                  for future in as_completed(futures):
+                      try:
+                          result = future.result()
+                          if result:
+                              sent_count += 1
+                          else:
+                              failed_count += 1
+                      except Exception as e:
+                          failed_count += 1
+                          print(f"Future execution error: {str(e)}")
+              
+              print(f"Broadcast complete: {sent_count} sent, {failed_count} failed")
+              return {'statusCode': 200, 'sent': sent_count, 'failed': failed_count}
+
+          def send_message(connection, message):
+              try:
+                  connection_id = connection['connectionId']
+                  domain = connection['domain']
+                  stage = connection['stage']
+                  
+                  apigateway = boto3.client('apigatewaymanagementapi',
+                      endpoint_url=f'https://{domain}/{stage}'
+                  )
+                  
+                  apigateway.post_to_connection(
+                      ConnectionId=connection_id,
+                      Data=json.dumps(message)
+                  )
+                  
+                  return True
+                  
+              except apigateway.exceptions.GoneException:
+                  # Connection is stale, remove it
+                  try:
+                      connections_table.delete_item(
+                          Key={'connectionId': connection['connectionId']}
+                      )
+                      redis_client.srem('active_connections', connection['connectionId'])
+                  except:
+                      pass
+                  return False
+                  
+              except Exception as e:
+                  print(f"Send message error: {str(e)}")
+                  return False
+
+  # DynamoDB Table for Connection Management
+  ConnectionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'bitcoin-websocket-connections-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: connectionId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: connectionId
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ElastiCache Redis Cluster for Fast Data Access
+  RedisSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: Subnet group for Redis cluster
+      SubnetIds: !Ref SubnetIds
+
+  RedisCluster:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Properties:
+      ReplicationGroupId: !Sub 'bitcoin-redis-${Environment}'
+      Description: 'Redis cluster for WebSocket API caching'
+      NodeType: cache.r6g.large
+      Engine: redis
+      EngineVersion: 7.0
+      NumCacheClusters: 2
+      Port: 6379
+      SecurityGroupIds:
+        - !Ref RedisSecurityGroup
+      SubnetGroupName: !Ref RedisSubnetGroup
+      AtRestEncryptionEnabled: true
+      TransitEncryptionEnabled: true
+      MultiAZEnabled: true
+      AutomaticFailoverEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  RedisSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub 'redis-sg-${Environment}'
+      GroupDescription: Security group for Redis cluster
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref LambdaSecurityGroupId
+          Description: Redis access from Lambda functions
+      Tags:
+        - Key: Name
+          Value: !Sub 'Redis-SG-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Role for WebSocket Lambda Functions
+  WebSocketLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'BitcoinWebSocketLambdaRole-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCExecutionRole
+      Policies:
+        - PolicyName: WebSocketApiPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - execute-api:ManageConnections
+                Resource: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*/*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Scan
+                  - dynamodb:Query
+                Resource: !GetAtt ConnectionsTable.Arn
+              - Effect: Allow
+                Action:
+                  - sagemaker:InvokeEndpoint
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/bitcoin/*'
+
+  # WebSocket Routes
+  ConnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $connect
+      Target: !Sub 'integrations/${ConnectIntegration}'
+
+  DisconnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $disconnect
+      Target: !Sub 'integrations/${DisconnectIntegration}'
+
+  DefaultRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $default
+      Target: !Sub 'integrations/${MessageIntegration}'
+
+  # WebSocket Integrations
+  ConnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ConnectFunction.Arn}/invocations'
+
+  DisconnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DisconnectFunction.Arn}/invocations'
+
+  MessageIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${MessageFunction.Arn}/invocations'
+
+  # Lambda Permissions
+  ConnectPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ConnectFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*'
+
+  DisconnectPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DisconnectFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*'
+
+  MessagePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref MessageFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*'
+
+  # WebSocket Deployment and Stage
+  WebSocketDeployment:
+    Type: AWS::ApiGatewayV2::Deployment
+    DependsOn:
+      - ConnectRoute
+      - DisconnectRoute
+      - DefaultRoute
+    Properties:
+      ApiId: !Ref WebSocketApi
+
+  WebSocketStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref WebSocketApi
+      DeploymentId: !Ref WebSocketDeployment
+      StageName: !Ref Environment
+      DefaultRouteSettings:
+        ThrottlingRateLimit: 1000
+        ThrottlingBurstLimit: 2000
+        DataTraceEnabled: true
+        DetailedMetricsEnabled: true
+        LoggingLevel: INFO
+      AccessLogSettings:
+        DestinationArn: !GetAtt WebSocketLogGroup.Arn
+        Format: '$context.requestId $context.connectionId $context.eventType $context.routeKey $context.status'
+      Tags:
+        Environment: !Ref Environment
+
+  # CloudWatch Log Group
+  WebSocketLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/bitcoin-websocket-${Environment}'
+      RetentionInDays: 14
+
+  # CloudWatch Alarms
+  WebSocketErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'WebSocket-HighErrors-${Environment}'
+      AlarmDescription: 'WebSocket API experiencing high error rate'
+      MetricName: 4XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub 'bitcoin-websocket-api-${Environment}'
+      TreatMissingData: notBreaching
+
+  RedisConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'Redis-HighConnections-${Environment}'
+      AlarmDescription: 'Redis cluster has high connection count'
+      MetricName: CurrConnections
+      Namespace: AWS/ElastiCache
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: CacheClusterId
+          Value: !Ref RedisCluster
+      TreatMissingData: notBreaching
+
+Outputs:
+  WebSocketApiId:
+    Description: WebSocket API ID
+    Value: !Ref WebSocketApi
+    Export:
+      Name: !Sub '${AWS::StackName}-WebSocketApiId'
+
+  WebSocketApiEndpoint:
+    Description: WebSocket API endpoint URL
+    Value: !Sub 'wss://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/${WebSocketStage}'
+    Export:
+      Name: !Sub '${AWS::StackName}-WebSocketEndpoint'
+
+  ConnectionsTableName:
+    Description: DynamoDB table for WebSocket connections
+    Value: !Ref ConnectionsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-ConnectionsTable'
+
+  BroadcastFunctionArn:
+    Description: ARN of the broadcast function
+    Value: !GetAtt BroadcastFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BroadcastFunction'
+
+  RedisEndpoint:
+    Description: Redis cluster endpoint
+    Value: !GetAtt RedisCluster.RedisEndpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-RedisEndpoint'

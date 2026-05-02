@@ -1,0 +1,272 @@
+{
+  "widgets": [
+    {
+      "type": "metric",
+      "x": 0,
+      "y": 0,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "metrics": [
+          [ "Bitcoin/Prediction", "NewsAPI.ArticlesCount" ],
+          [ "Bitcoin/Prediction", "CryptoCompare.TotalDataTypesCollected" ],
+          [ "Bitcoin/Prediction", "CoinAPI.TotalDataTypesCollected" ]
+        ],
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "eu-west-2",
+        "title": "Data Collection Metrics",
+        "period": 300,
+        "stat": "Sum"
+      }
+    },
+    {
+      "type": "metric",
+      "x": 12,
+      "y": 0,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "metrics": [
+          [ "Bitcoin/Prediction", "NewsAPI.RequestFailures" ],
+          [ "Bitcoin/Prediction", "CryptoCompare.PriceRequestFailures" ],
+          [ "Bitcoin/Prediction", "CoinAPI.RateRequestFailures" ]
+        ],
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "eu-west-2",
+        "title": "API Request Failures",
+        "period": 300,
+        "stat": "Sum",
+        "yAxis": {
+          "left": {
+            "min": 0
+          }
+        }
+      }
+    },
+    {
+      "type": "metric",
+      "x": 0,
+      "y": 6,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "metrics": [
+          [ "Bitcoin/Prediction", "SentimentAnalysis.ProcessedMessages" ],
+          [ "Bitcoin/Prediction", "SentimentAnalysis.ArticlesProcessed" ],
+          [ "Bitcoin/Prediction", "SentimentAnalysis.SentimentScore" ]
+        ],
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "eu-west-2",
+        "title": "Sentiment Analysis Metrics",
+        "period": 300,
+        "stat": "Average"
+      }
+    },
+    {
+      "type": "metric",
+      "x": 12,
+      "y": 6,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "metrics": [
+          [ "Bitcoin/Prediction", "FeatureEngineering.FeaturesExtracted" ],
+          [ "Bitcoin/Prediction", "FeatureEngineering.DataQualityScore" ],
+          [ "Bitcoin/Prediction", "FeatureEngineering.DataSources" ]
+        ],
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "eu-west-2",
+        "title": "Feature Engineering Metrics",
+        "period": 300,
+        "stat": "Average"
+      }
+    },
+    {
+      "type": "metric",
+      "x": 0,
+      "y": 12,
+      "width": 8,
+      "height": 6,
+      "properties": {
+        "metrics": [
+          [ "Bitcoin/Prediction", "Prediction.CurrentPrice" ]
+        ],
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "eu-west-2",
+        "title": "Bitcoin Current Price",
+        "period": 300,
+        "stat": "Average",
+        "yAxis": {
+          "left": {
+            "label": "USD"
+          }
+        }
+      }
+    },
+    {
+      "type": "metric",
+      "x": 8,
+      "y": 12,
+      "width": 8,
+      "height": 6,
+      "properties": {
+        "metrics": [
+          [ "Bitcoin/Prediction", "Prediction.Change.1h" ],
+          [ "Bitcoin/Prediction", "Prediction.Change.24h" ],
+          [ "Bitcoin/Prediction", "Prediction.Change.7d" ]
+        ],
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "eu-west-2",
+        "title": "Predicted Price Changes (%)",
+        "period": 300,
+        "stat": "Average",
+        "yAxis": {
+          "left": {
+            "label": "Percent"
+          }
+        }
+      }
+    },
+    {
+      "type": "metric",
+      "x": 16,
+      "y": 12,
+      "width": 8,
+      "height": 6,
+      "properties": {
+        "metrics": [
+          [ "Bitcoin/Prediction", "Prediction.ConfidenceScore" ]
+        ],
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "eu-west-2",
+        "title": "Prediction Confidence Score",
+        "period": 300,
+        "stat": "Average",
+        "yAxis": {
+          "left": {
+            "min": 0,
+            "max": 1
+          }
+        }
+      }
+    },
+    {
+      "type": "metric",
+      "x": 0,
+      "y": 18,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "metrics": [
+          [ "AWS/Lambda", "Duration", "FunctionName", "bitcoin-newsapi-collector" ],
+          [ "AWS/Lambda", "Duration", "FunctionName", "bitcoin-cryptocompare-collector" ],
+          [ "AWS/Lambda", "Duration", "FunctionName", "bitcoin-coinapi-collector" ],
+          [ "AWS/Lambda", "Duration", "FunctionName", "bitcoin-sentiment-analyzer" ],
+          [ "AWS/Lambda", "Duration", "FunctionName", "bitcoin-feature-engineer" ],
+          [ "AWS/Lambda", "Duration", "FunctionName", "bitcoin-predictor" ]
+        ],
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "eu-west-2",
+        "title": "Lambda Function Duration",
+        "period": 300,
+        "stat": "Average",
+        "yAxis": {
+          "left": {
+            "label": "Milliseconds"
+          }
+        }
+      }
+    },
+    {
+      "type": "metric",
+      "x": 12,
+      "y": 18,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "metrics": [
+          [ "AWS/Lambda", "Errors", "FunctionName", "bitcoin-newsapi-collector" ],
+          [ "AWS/Lambda", "Errors", "FunctionName", "bitcoin-cryptocompare-collector" ],
+          [ "AWS/Lambda", "Errors", "FunctionName", "bitcoin-coinapi-collector" ],
+          [ "AWS/Lambda", "Errors", "FunctionName", "bitcoin-sentiment-analyzer" ],
+          [ "AWS/Lambda", "Errors", "FunctionName", "bitcoin-feature-engineer" ],
+          [ "AWS/Lambda", "Errors", "FunctionName", "bitcoin-predictor" ]
+        ],
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "eu-west-2",
+        "title": "Lambda Function Errors",
+        "period": 300,
+        "stat": "Sum",
+        "yAxis": {
+          "left": {
+            "min": 0
+          }
+        }
+      }
+    },
+    {
+      "type": "metric",
+      "x": 0,
+      "y": 24,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "metrics": [
+          [ "AWS/SQS", "NumberOfMessagesSent", "QueueName", "bitcoin-data-processing" ],
+          [ "AWS/SQS", "NumberOfMessagesReceived", "QueueName", "bitcoin-data-processing" ],
+          [ "AWS/SQS", "NumberOfMessagesSent", "QueueName", "bitcoin-prediction" ],
+          [ "AWS/SQS", "NumberOfMessagesReceived", "QueueName", "bitcoin-prediction" ]
+        ],
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "eu-west-2",
+        "title": "SQS Message Flow",
+        "period": 300,
+        "stat": "Sum"
+      }
+    },
+    {
+      "type": "metric",
+      "x": 12,
+      "y": 24,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "metrics": [
+          [ "AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "bitcoin-predictions" ],
+          [ "AWS/DynamoDB", "ConsumedWriteCapacityUnits", "TableName", "bitcoin-predictions" ],
+          [ "AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "bitcoin-raw-data" ],
+          [ "AWS/DynamoDB", "ConsumedWriteCapacityUnits", "TableName", "bitcoin-raw-data" ]
+        ],
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "eu-west-2",
+        "title": "DynamoDB Capacity Usage",
+        "period": 300,
+        "stat": "Sum"
+      }
+    },
+    {
+      "type": "log",
+      "x": 0,
+      "y": 30,
+      "width": 24,
+      "height": 6,
+      "properties": {
+        "query": "SOURCE '/aws/lambda/bitcoin-newsapi-collector'\n| SOURCE '/aws/lambda/bitcoin-cryptocompare-collector'\n| SOURCE '/aws/lambda/bitcoin-coinapi-collector'\n| SOURCE '/aws/lambda/bitcoin-sentiment-analyzer'\n| SOURCE '/aws/lambda/bitcoin-feature-engineer'\n| SOURCE '/aws/lambda/bitcoin-predictor'\n| fields @timestamp, @message\n| filter @message like /ERROR/\n| sort @timestamp desc\n| limit 50",
+        "region": "eu-west-2",
+        "title": "Recent Errors Across All Functions",
+        "view": "table"
+      }
+    }
+  ]
+}

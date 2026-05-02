@@ -1,0 +1,72 @@
+{
+  "name": "bitcoin-realtime-dashboard",
+  "version": "1.0.0",
+  "description": "Real-time Bitcoin prediction dashboard",
+  "private": true,
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-scripts": "5.0.1",
+    "web-vitals": "^3.3.2",
+    "recharts": "^2.6.2",
+    "socket.io-client": "^4.7.1",
+    "aws-amplify": "^5.3.5",
+    "@aws-amplify/ui-react": "^5.0.5",
+    "styled-components": "^5.3.11",
+    "antd": "^5.6.2",
+    "@ant-design/icons": "^5.1.4",
+    "moment": "^2.29.4",
+    "lodash": "^4.17.21",
+    "numeral": "^2.0.6",
+    "react-router-dom": "^6.13.0",
+    "axios": "^1.4.0",
+    "react-query": "^3.39.3",
+    "react-hook-form": "^7.45.0",
+    "react-helmet": "^6.1.0",
+    "react-chartjs-2": "^5.2.0",
+    "chart.js": "^4.3.0",
+    "react-grid-layout": "^1.3.4",
+    "react-virtualized": "^9.22.3",
+    "react-window": "^1.8.8",
+    "framer-motion": "^10.12.16"
+  },
+  "scripts": {
+    "start": "react-scripts start",
+    "build": "react-scripts build",
+    "test": "react-scripts test",
+    "eject": "react-scripts eject",
+    "analyze": "npm run build && npx bundle-analyzer build/static/js/*.js",
+    "predeploy": "npm run build",
+    "deploy": "aws s3 sync build/ s3://bitcoin-dashboard-frontend --delete"
+  },
+  "eslintConfig": {
+    "extends": [
+      "react-app",
+      "react-app/jest"
+    ]
+  },
+  "browserslist": {
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version",
+      "last 1 firefox version",
+      "last 1 safari version"
+    ]
+  },
+  "devDependencies": {
+    "@types/react": "^18.2.8",
+    "@types/react-dom": "^18.2.4",
+    "@types/node": "^20.3.1",
+    "@types/lodash": "^4.14.195",
+    "@types/numeral": "^2.0.2",
+    "@types/react-helmet": "^6.1.6",
+    "@types/react-grid-layout": "^1.3.2",
+    "@types/react-virtualized": "^9.21.21",
+    "@types/react-window": "^1.8.5",
+    "typescript": "^5.1.3"
+  }
+}

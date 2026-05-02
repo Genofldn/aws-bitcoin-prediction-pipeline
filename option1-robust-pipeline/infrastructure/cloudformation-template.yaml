@@ -1,0 +1,387 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Robust Bitcoin Prediction Pipeline Infrastructure'
+
+Parameters:
+  NewsApiKey:
+    Type: String
+    Description: NewsAPI Key (obtain from https://newsapi.org)
+    NoEcho: true
+
+  CryptoCompareApiKey:
+    Type: String
+    Description: CryptoCompare API Key (obtain from https://cryptocompare.com)
+    NoEcho: true
+
+Resources:
+  # API Keys in Parameter Store
+  NewsApiKeyParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /bitcoin/newsapi/key
+      Type: SecureString
+      Value: !Ref NewsApiKey
+      Description: NewsAPI Key for Bitcoin prediction pipeline
+
+  CryptoCompareApiKeyParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /bitcoin/cryptocompare/key
+      Type: SecureString
+      Value: !Ref CryptoCompareApiKey
+      Description: CryptoCompare API Key for Bitcoin prediction pipeline
+
+  # SQS Queues with Dead Letter Queues
+  BitcoinDataProcessingDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: bitcoin-data-processing-dlq
+      MessageRetentionPeriod: 1209600  # 14 days
+      VisibilityTimeoutSeconds: 60
+
+  BitcoinDataProcessingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: bitcoin-data-processing
+      VisibilityTimeoutSeconds: 300
+      MessageRetentionPeriod: 1209600
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt BitcoinDataProcessingDLQ.Arn
+        maxReceiveCount: 3
+
+  BitcoinPredictionDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: bitcoin-prediction-dlq
+      MessageRetentionPeriod: 1209600
+      VisibilityTimeoutSeconds: 60
+
+  BitcoinPredictionQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: bitcoin-prediction
+      VisibilityTimeoutSeconds: 300
+      MessageRetentionPeriod: 1209600
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt BitcoinPredictionDLQ.Arn
+        maxReceiveCount: 3
+
+  # DynamoDB Tables
+  BitcoinPredictionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: bitcoin-predictions
+      BillingMode: ON_DEMAND
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+        - AttributeName: prediction_type
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: prediction-type-timestamp-index
+          KeySchema:
+            - AttributeName: prediction_type
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+
+  BitcoinRawDataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: bitcoin-raw-data
+      BillingMode: ON_DEMAND
+      AttributeDefinitions:
+        - AttributeName: source
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+      KeySchema:
+        - AttributeName: source
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # S3 Bucket for data storage
+  BitcoinDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'bitcoin-prediction-data-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ArchiveOldData
+            Status: Enabled
+            ExpirationInDays: 365
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # Lambda Functions
+  NewsApiCollectorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: bitcoin-newsapi-collector
+      Runtime: python3.9
+      Handler: newsapi-collector.lambda_handler
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              return {'statusCode': 200, 'body': 'Function placeholder'}
+      Timeout: 300
+      MemorySize: 512
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/BitcoinLambdaExecutionRole'
+      Environment:
+        Variables:
+          SQS_QUEUE_URL: !Ref BitcoinDataProcessingQueue
+          NEWSAPI_PARAM_NAME: /bitcoin/newsapi/key
+      DeadLetterConfig:
+        TargetArn: !GetAtt BitcoinDataProcessingDLQ.Arn
+
+  CryptoCompareCollectorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: bitcoin-cryptocompare-collector
+      Runtime: python3.9
+      Handler: cryptocompare-collector.lambda_handler
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              return {'statusCode': 200, 'body': 'Function placeholder'}
+      Timeout: 300
+      MemorySize: 512
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/BitcoinLambdaExecutionRole'
+      Environment:
+        Variables:
+          SQS_QUEUE_URL: !Ref BitcoinDataProcessingQueue
+          CRYPTOCOMPARE_PARAM_NAME: /bitcoin/cryptocompare/key
+
+  CoinApiCollectorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: bitcoin-coinapi-collector
+      Runtime: python3.9
+      Handler: coinapi-collector.lambda_handler
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              return {'statusCode': 200, 'body': 'Function placeholder'}
+      Timeout: 300
+      MemorySize: 512
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/BitcoinLambdaExecutionRole'
+      Environment:
+        Variables:
+          SQS_QUEUE_URL: !Ref BitcoinDataProcessingQueue
+
+  SentimentAnalyzerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: bitcoin-sentiment-analyzer
+      Runtime: python3.9
+      Handler: sentiment-analyzer.lambda_handler
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              return {'statusCode': 200, 'body': 'Function placeholder'}
+      Timeout: 300
+      MemorySize: 1024
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/BitcoinLambdaExecutionRole'
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref BitcoinRawDataTable
+          SQS_QUEUE_URL: !Ref BitcoinPredictionQueue
+
+  FeatureEngineerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: bitcoin-feature-engineer
+      Runtime: python3.9
+      Handler: feature-engineer.lambda_handler
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              return {'statusCode': 200, 'body': 'Function placeholder'}
+      Timeout: 300
+      MemorySize: 1024
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/BitcoinLambdaExecutionRole'
+      Environment:
+        Variables:
+          DYNAMODB_RAW_TABLE: !Ref BitcoinRawDataTable
+          DYNAMODB_PREDICTIONS_TABLE: !Ref BitcoinPredictionsTable
+
+  PredictorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: bitcoin-predictor
+      Runtime: python3.9
+      Handler: predictor.lambda_handler
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              return {'statusCode': 200, 'body': 'Function placeholder'}
+      Timeout: 300
+      MemorySize: 2048
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/BitcoinLambdaExecutionRole'
+      Environment:
+        Variables:
+          DYNAMODB_PREDICTIONS_TABLE: !Ref BitcoinPredictionsTable
+          S3_BUCKET: !Ref BitcoinDataBucket
+
+  # EventBridge Rules for Scheduling
+  DataCollectionSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: bitcoin-data-collection-schedule
+      Description: Trigger data collection every 5 minutes
+      ScheduleExpression: rate(5 minutes)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt NewsApiCollectorFunction.Arn
+          Id: NewsApiTarget
+        - Arn: !GetAtt CryptoCompareCollectorFunction.Arn
+          Id: CryptoCompareTarget
+        - Arn: !GetAtt CoinApiCollectorFunction.Arn
+          Id: CoinApiTarget
+
+  PredictionSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: bitcoin-prediction-schedule
+      Description: Trigger predictions every hour
+      ScheduleExpression: rate(1 hour)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt FeatureEngineerFunction.Arn
+          Id: FeatureEngineerTarget
+        - Arn: !GetAtt PredictorFunction.Arn
+          Id: PredictorTarget
+
+  # Lambda Permissions for EventBridge
+  NewsApiCollectorPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref NewsApiCollectorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DataCollectionSchedule.Arn
+
+  CryptoCompareCollectorPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CryptoCompareCollectorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DataCollectionSchedule.Arn
+
+  CoinApiCollectorPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CoinApiCollectorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DataCollectionSchedule.Arn
+
+  FeatureEngineerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FeatureEngineerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt PredictionSchedule.Arn
+
+  PredictorPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PredictorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt PredictionSchedule.Arn
+
+  # SQS Event Source Mappings
+  SentimentAnalyzerEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt BitcoinDataProcessingQueue.Arn
+      FunctionName: !Ref SentimentAnalyzerFunction
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 30
+
+  # CloudWatch Log Groups
+  NewsApiCollectorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${NewsApiCollectorFunction}'
+      RetentionInDays: 14
+
+  CryptoCompareCollectorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${CryptoCompareCollectorFunction}'
+      RetentionInDays: 14
+
+  SentimentAnalyzerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${SentimentAnalyzerFunction}'
+      RetentionInDays: 14
+
+  PredictorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${PredictorFunction}'
+      RetentionInDays: 14
+
+Outputs:
+  DataProcessingQueueUrl:
+    Description: URL of the data processing SQS queue
+    Value: !Ref BitcoinDataProcessingQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-DataProcessingQueueUrl'
+
+  PredictionQueueUrl:
+    Description: URL of the prediction SQS queue
+    Value: !Ref BitcoinPredictionQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-PredictionQueueUrl'
+
+  PredictionsTableName:
+    Description: Name of the predictions DynamoDB table
+    Value: !Ref BitcoinPredictionsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-PredictionsTableName'
+
+  RawDataTableName:
+    Description: Name of the raw data DynamoDB table
+    Value: !Ref BitcoinRawDataTable
+    Export:
+      Name: !Sub '${AWS::StackName}-RawDataTableName'
+
+  DataBucketName:
+    Description: Name of the S3 data bucket
+    Value: !Ref BitcoinDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-DataBucketName'

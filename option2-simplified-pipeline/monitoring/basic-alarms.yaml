@@ -1,0 +1,268 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Basic Monitoring and Alarms for Simple Bitcoin Pipeline'
+
+Parameters:
+  LambdaFunctionName:
+    Type: String
+    Default: 'bitcoin-simple-predictor'
+    Description: Name of the Lambda function to monitor
+  
+  S3BucketName:
+    Type: String
+    Description: Name of the S3 bucket storing predictions
+  
+  NotificationEmail:
+    Type: String
+    Default: 'admin@example.com'
+    Description: Email address for alarm notifications
+
+Resources:
+  # SNS Topic for Notifications
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: bitcoin-simple-alerts
+      DisplayName: Bitcoin Simple Pipeline Alerts
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotificationEmail
+
+  # Lambda Function Error Alarm
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${LambdaFunctionName}-Errors'
+      AlarmDescription: 'Lambda function is experiencing errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref LambdaFunctionName
+      AlarmActions:
+        - !Ref AlertTopic
+      TreatMissingData: notBreaching
+
+  # Lambda Function Duration Alarm
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${LambdaFunctionName}-HighDuration'
+      AlarmDescription: 'Lambda function taking too long to execute'
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 240000  # 4 minutes (function timeout is 5 minutes)
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref LambdaFunctionName
+      AlarmActions:
+        - !Ref AlertTopic
+      TreatMissingData: notBreaching
+
+  # Lambda Function Throttle Alarm
+  LambdaThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${LambdaFunctionName}-Throttles'
+      AlarmDescription: 'Lambda function is being throttled'
+      MetricName: Throttles
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref LambdaFunctionName
+      AlarmActions:
+        - !Ref AlertTopic
+      TreatMissingData: notBreaching
+
+  # Lambda Invocation Alarm (no predictions being made)
+  LambdaNoInvocationsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${LambdaFunctionName}-NoInvocations'
+      AlarmDescription: 'Lambda function not being invoked (predictions stopped)'
+      MetricName: Invocations
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 900  # 15 minutes
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref LambdaFunctionName
+      AlarmActions:
+        - !Ref AlertTopic
+      TreatMissingData: breaching
+
+  # S3 Bucket Size Alarm (too much storage)
+  S3BucketSizeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${S3BucketName}-LargeSize'
+      AlarmDescription: 'S3 bucket growing too large (cost concern)'
+      MetricName: BucketSizeBytes
+      Namespace: AWS/S3
+      Statistic: Average
+      Period: 86400  # Daily check
+      EvaluationPeriods: 1
+      Threshold: 1073741824  # 1GB
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: BucketName
+          Value: !Ref S3BucketName
+        - Name: StorageType
+          Value: StandardStorage
+      AlarmActions:
+        - !Ref AlertTopic
+      TreatMissingData: notBreaching
+
+  # Custom Metric: Prediction Success Rate
+  PredictionSuccessMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${LambdaFunctionName}'
+      FilterPattern: '"Prediction completed"'
+      MetricTransformations:
+        - MetricNamespace: BitcoinSimple/Predictions
+          MetricName: SuccessfulPredictions
+          MetricValue: '1'
+          DefaultValue: 0
+
+  # Custom Metric: API Failures
+  APIFailureMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${LambdaFunctionName}'
+      FilterPattern: '"Failed to fetch"'
+      MetricTransformations:
+        - MetricNamespace: BitcoinSimple/API
+          MetricName: APIFailures
+          MetricValue: '1'
+          DefaultValue: 0
+
+  # API Failure Rate Alarm
+  APIFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: 'BitcoinSimple-APIFailures'
+      AlarmDescription: 'High rate of API failures'
+      MetricName: APIFailures
+      Namespace: BitcoinSimple/API
+      Statistic: Sum
+      Period: 900  # 15 minutes
+      EvaluationPeriods: 2
+      Threshold: 3
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlertTopic
+      TreatMissingData: notBreaching
+
+  # Prediction Success Rate Alarm
+  LowPredictionRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: 'BitcoinSimple-LowPredictionRate'
+      AlarmDescription: 'Prediction success rate is too low'
+      MetricName: SuccessfulPredictions
+      Namespace: BitcoinSimple/Predictions
+      Statistic: Sum
+      Period: 3600  # 1 hour
+      EvaluationPeriods: 2
+      Threshold: 6  # Should have 12 predictions per hour (every 5 minutes)
+      ComparisonOperator: LessThanThreshold
+      AlarmActions:
+        - !Ref AlertTopic
+      TreatMissingData: breaching
+
+  # Dashboard for monitoring
+  SimpleMonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: BitcoinSimplePipeline
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${LambdaFunctionName}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Duration", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Lambda Function Metrics",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "BitcoinSimple/Predictions", "SuccessfulPredictions" ],
+                  [ "BitcoinSimple/API", "APIFailures" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Custom Metrics",
+                "period": 300
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${LambdaFunctionName}'\n| fields @timestamp, @message\n| filter @message like /Prediction completed/\n| sort @timestamp desc\n| limit 20",
+                "region": "${AWS::Region}",
+                "title": "Recent Successful Predictions",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  SNSTopicArn:
+    Description: ARN of the SNS topic for alerts
+    Value: !Ref AlertTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-AlertTopicArn'
+
+  DashboardURL:
+    Description: URL of the CloudWatch dashboard
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=BitcoinSimplePipeline'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  AlertTopicName:
+    Description: Name of the SNS topic for alerts
+    Value: !Ref AlertTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-AlertTopicName'

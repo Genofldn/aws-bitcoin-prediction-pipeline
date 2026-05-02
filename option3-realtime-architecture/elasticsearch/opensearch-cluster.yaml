@@ -1,0 +1,675 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'OpenSearch Service Cluster for Real-time Bitcoin Analytics'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: 'production'
+    AllowedValues: ['development', 'staging', 'production']
+    Description: Deployment environment
+  
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID for OpenSearch cluster
+  
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnet IDs for OpenSearch cluster (private subnets)
+  
+  MasterUserArn:
+    Type: String
+    Description: ARN of the IAM user/role for OpenSearch master user
+
+Resources:
+  # OpenSearch Service Domain
+  OpenSearchDomain:
+    Type: AWS::OpenSearchService::Domain
+    Properties:
+      DomainName: !Sub 'bitcoin-analytics-${Environment}'
+      EngineVersion: 'OpenSearch_2.5'
+      ClusterConfig:
+        InstanceType: !If 
+          - IsProduction
+          - r6g.large.search
+          - t3.small.search
+        InstanceCount: !If
+          - IsProduction
+          - 3
+          - 1
+        DedicatedMasterEnabled: !If
+          - IsProduction
+          - true
+          - false
+        MasterInstanceType: !If
+          - IsProduction
+          - r6g.medium.search
+          - !Ref 'AWS::NoValue'
+        MasterInstanceCount: !If
+          - IsProduction
+          - 3
+          - !Ref 'AWS::NoValue'
+        ZoneAwarenessEnabled: !If
+          - IsProduction
+          - true
+          - false
+        ZoneAwarenessConfig: !If
+          - IsProduction
+          - AvailabilityZoneCount: 3
+          - !Ref 'AWS::NoValue'
+        WarmEnabled: false
+      EBSOptions:
+        EBSEnabled: true
+        VolumeType: gp3
+        VolumeSize: !If
+          - IsProduction
+          - 100
+          - 20
+        Iops: 3000
+        Throughput: 250
+      VPCOptions:
+        SecurityGroupIds:
+          - !Ref OpenSearchSecurityGroup
+        SubnetIds: !Ref SubnetIds
+      EncryptionAtRestOptions:
+        Enabled: true
+      NodeToNodeEncryptionOptions:
+        Enabled: true
+      DomainEndpointOptions:
+        EnforceHTTPS: true
+        TLSSecurityPolicy: 'Policy-Min-TLS-1-2-2019-07'
+      AdvancedSecurityOptions:
+        Enabled: true
+        InternalUserDatabaseEnabled: false
+        MasterUserOptions:
+          MasterUserARN: !Ref MasterUserArn
+        SAMLOptions:
+          Enabled: false
+      LogPublishingOptions:
+        SEARCH_SLOW_LOGS:
+          Enabled: true
+          CloudWatchLogsLogGroupArn: !GetAtt SearchSlowLogsGroup.Arn
+        INDEX_SLOW_LOGS:
+          Enabled: true
+          CloudWatchLogsLogGroupArn: !GetAtt IndexSlowLogsGroup.Arn
+        ES_APPLICATION_LOGS:
+          Enabled: true
+          CloudWatchLogsLogGroupArn: !GetAtt ApplicationLogsGroup.Arn
+      AdvancedOptions:
+        'rest.action.multi.allow_explicit_index': 'true'
+        'indices.fielddata.cache.size': '20%'
+        'indices.query.bool.max_clause_count': '1024'
+        'indices.breaker.fielddata.limit': '40%'
+        'indices.breaker.request.limit': '60%'
+        'indices.breaker.total.limit': '70%'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: Analytics
+        - Key: DataType
+          Value: BitcoinData
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'production']
+
+  # Security Group for OpenSearch
+  OpenSearchSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub 'opensearch-sg-${Environment}'
+      GroupDescription: Security group for OpenSearch cluster
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+          Description: HTTPS from Lambda functions
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref KibanaSecurityGroup
+          Description: HTTPS from Kibana/Dashboard access
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub 'OpenSearch-SG-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Security Group for Lambda Functions accessing OpenSearch
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub 'lambda-opensearch-sg-${Environment}'
+      GroupDescription: Security group for Lambda functions accessing OpenSearch
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          DestinationSecurityGroupId: !Ref OpenSearchSecurityGroup
+          Description: HTTPS to OpenSearch cluster
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS to AWS services
+      Tags:
+        - Key: Name
+          Value: !Sub 'Lambda-OpenSearch-SG-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Security Group for Kibana/Dashboard Access
+  KibanaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub 'kibana-sg-${Environment}'
+      GroupDescription: Security group for Kibana dashboard access
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 10.0.0.0/8
+          Description: HTTPS from VPC for Kibana access
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          DestinationSecurityGroupId: !Ref OpenSearchSecurityGroup
+          Description: HTTPS to OpenSearch cluster
+      Tags:
+        - Key: Name
+          Value: !Sub 'Kibana-SG-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Log Groups for OpenSearch
+  SearchSlowLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/opensearch/domains/bitcoin-analytics-${Environment}/search-slow-logs'
+      RetentionInDays: 7
+
+  IndexSlowLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/opensearch/domains/bitcoin-analytics-${Environment}/index-slow-logs'
+      RetentionInDays: 7
+
+  ApplicationLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/opensearch/domains/bitcoin-analytics-${Environment}/application-logs'
+      RetentionInDays: 14
+
+  # Lambda Function for Data Ingestion to OpenSearch
+  OpenSearchIngestionFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'bitcoin-opensearch-ingestion-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      MemorySize: 512
+      Timeout: 300
+      Role: !GetAtt OpenSearchLambdaRole.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds: !Ref SubnetIds
+      Environment:
+        Variables:
+          OPENSEARCH_ENDPOINT: !GetAtt OpenSearchDomain.DomainEndpoint
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import base64
+          from datetime import datetime, timezone
+          from opensearchpy import OpenSearch, RequestsHttpConnection
+          from aws_requests_auth.aws_auth import AWSRequestsAuth
+
+          def lambda_handler(event, context):
+              opensearch_endpoint = f"https://{os.environ['OPENSEARCH_ENDPOINT']}"
+              region = os.environ['AWS_REGION']
+              service = 'es'
+              credentials = boto3.Session().get_credentials()
+              awsauth = AWSRequestsAuth(credentials, region, service)
+              
+              client = OpenSearch(
+                  hosts=[{'host': os.environ['OPENSEARCH_ENDPOINT'], 'port': 443}],
+                  http_auth=awsauth,
+                  use_ssl=True,
+                  verify_certs=True,
+                  connection_class=RequestsHttpConnection
+              )
+              
+              try:
+                  # Process Kinesis records
+                  for record in event['Records']:
+                      if 'kinesis' in record:
+                          # Decode Kinesis data
+                          payload = base64.b64decode(record['kinesis']['data'])
+                          data = json.loads(payload)
+                          
+                          # Determine index based on data type
+                          index_name = get_index_name(data)
+                          
+                          # Add metadata
+                          data['@timestamp'] = datetime.now(timezone.utc).isoformat()
+                          data['processed_at'] = datetime.now(timezone.utc).isoformat()
+                          data['source_kinesis'] = record['kinesis']['sequenceNumber']
+                          
+                          # Index document
+                          response = client.index(
+                              index=index_name,
+                              body=data,
+                              refresh=True
+                          )
+                          
+                          print(f"Indexed document to {index_name}: {response['_id']}")
+                      
+                      elif 'Sns' in record:
+                          # Handle SNS notifications (alerts, etc.)
+                          message = json.loads(record['Sns']['Message'])
+                          
+                          alert_doc = {
+                              '@timestamp': datetime.now(timezone.utc).isoformat(),
+                              'alert_type': message.get('AlarmName', 'unknown'),
+                              'alert_data': message,
+                              'environment': os.environ['ENVIRONMENT']
+                          }
+                          
+                          client.index(
+                              index=f'bitcoin-alerts-{datetime.now().strftime("%Y-%m")}',
+                              body=alert_doc,
+                              refresh=True
+                          )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Successfully processed records')
+                  }
+                  
+              except Exception as e:
+                  print(f"Error processing records: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error: {str(e)}')
+                  }
+
+          def get_index_name(data):
+              """Determine appropriate index based on data content"""
+              current_date = datetime.now().strftime("%Y-%m")
+              
+              if 'price' in data and 'timestamp' in data:
+                  return f'bitcoin-prices-{current_date}'
+              elif 'title' in data or 'news' in data:
+                  return f'bitcoin-news-{current_date}'
+              elif 'sentiment' in data:
+                  return f'bitcoin-sentiment-{current_date}'
+              elif 'prediction' in data:
+                  return f'bitcoin-predictions-{current_date}'
+              else:
+                  return f'bitcoin-general-{current_date}'
+
+  # Lambda Function for OpenSearch Index Management
+  IndexManagementFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'bitcoin-opensearch-index-mgmt-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      MemorySize: 256
+      Timeout: 600
+      Role: !GetAtt OpenSearchLambdaRole.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds: !Ref SubnetIds
+      Environment:
+        Variables:
+          OPENSEARCH_ENDPOINT: !GetAtt OpenSearchDomain.DomainEndpoint
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime, timedelta
+          from opensearchpy import OpenSearch, RequestsHttpConnection
+          from aws_requests_auth.aws_auth import AWSRequestsAuth
+
+          def lambda_handler(event, context):
+              opensearch_endpoint = f"https://{os.environ['OPENSEARCH_ENDPOINT']}"
+              region = os.environ['AWS_REGION']
+              service = 'es'
+              credentials = boto3.Session().get_credentials()
+              awsauth = AWSRequestsAuth(credentials, region, service)
+              
+              client = OpenSearch(
+                  hosts=[{'host': os.environ['OPENSEARCH_ENDPOINT'], 'port': 443}],
+                  http_auth=awsauth,
+                  use_ssl=True,
+                  verify_certs=True,
+                  connection_class=RequestsHttpConnection
+              )
+              
+              try:
+                  action = event.get('action', 'setup_indices')
+                  
+                  if action == 'setup_indices':
+                      return setup_indices(client)
+                  elif action == 'rotate_indices':
+                      return rotate_indices(client)
+                  elif action == 'cleanup_old_indices':
+                      return cleanup_old_indices(client)
+                  else:
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps('Unknown action')
+                      }
+                      
+              except Exception as e:
+                  print(f"Index management error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error: {str(e)}')
+                  }
+
+          def setup_indices(client):
+              """Create index templates and initial indices"""
+              
+              # Price data template
+              price_template = {
+                  "index_patterns": ["bitcoin-prices-*"],
+                  "template": {
+                      "mappings": {
+                          "properties": {
+                              "@timestamp": {"type": "date"},
+                              "timestamp": {"type": "date"},
+                              "price": {"type": "double"},
+                              "volume": {"type": "double"},
+                              "source": {"type": "keyword"},
+                              "exchange": {"type": "keyword"}
+                          }
+                      },
+                      "settings": {
+                          "number_of_shards": 1,
+                          "number_of_replicas": 1,
+                          "refresh_interval": "1s"
+                      }
+                  }
+              }
+              
+              # News data template
+              news_template = {
+                  "index_patterns": ["bitcoin-news-*"],
+                  "template": {
+                      "mappings": {
+                          "properties": {
+                              "@timestamp": {"type": "date"},
+                              "title": {"type": "text", "analyzer": "english"},
+                              "content": {"type": "text", "analyzer": "english"},
+                              "url": {"type": "keyword"},
+                              "source": {"type": "keyword"},
+                              "sentiment_score": {"type": "double"},
+                              "published_at": {"type": "date"}
+                          }
+                      },
+                      "settings": {
+                          "number_of_shards": 1,
+                          "number_of_replicas": 1
+                      }
+                  }
+              }
+              
+              # Prediction data template
+              prediction_template = {
+                  "index_patterns": ["bitcoin-predictions-*"],
+                  "template": {
+                      "mappings": {
+                          "properties": {
+                              "@timestamp": {"type": "date"},
+                              "current_price": {"type": "double"},
+                              "predictions": {"type": "object"},
+                              "confidence": {"type": "double"},
+                              "model_type": {"type": "keyword"},
+                              "features": {"type": "object"}
+                          }
+                      },
+                      "settings": {
+                          "number_of_shards": 1,
+                          "number_of_replicas": 1
+                      }
+                  }
+              }
+              
+              # Create templates
+              client.indices.put_index_template(name="bitcoin-prices", body=price_template)
+              client.indices.put_index_template(name="bitcoin-news", body=news_template)
+              client.indices.put_index_template(name="bitcoin-predictions", body=prediction_template)
+              
+              # Create initial indices for current month
+              current_month = datetime.now().strftime("%Y-%m")
+              indices = [
+                  f'bitcoin-prices-{current_month}',
+                  f'bitcoin-news-{current_month}',
+                  f'bitcoin-predictions-{current_month}',
+                  f'bitcoin-alerts-{current_month}'
+              ]
+              
+              for index in indices:
+                  if not client.indices.exists(index=index):
+                      client.indices.create(index=index)
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Index templates and initial indices created')
+              }
+
+          def rotate_indices(client):
+              """Create indices for next month"""
+              next_month = (datetime.now() + timedelta(days=32)).strftime("%Y-%m")
+              
+              indices = [
+                  f'bitcoin-prices-{next_month}',
+                  f'bitcoin-news-{next_month}',
+                  f'bitcoin-predictions-{next_month}',
+                  f'bitcoin-alerts-{next_month}'
+              ]
+              
+              for index in indices:
+                  if not client.indices.exists(index=index):
+                      client.indices.create(index=index)
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(f'Created indices for {next_month}')
+              }
+
+          def cleanup_old_indices(client):
+              """Delete indices older than 3 months"""
+              cutoff_date = datetime.now() - timedelta(days=90)
+              cutoff_month = cutoff_date.strftime("%Y-%m")
+              
+              indices = client.indices.get(index="bitcoin-*")
+              deleted_indices = []
+              
+              for index_name in indices.keys():
+                  # Extract date from index name (assuming format bitcoin-type-YYYY-MM)
+                  parts = index_name.split('-')
+                  if len(parts) >= 3:
+                      try:
+                          index_month = f"{parts[-2]}-{parts[-1]}"
+                          if index_month < cutoff_month:
+                              client.indices.delete(index=index_name)
+                              deleted_indices.append(index_name)
+                      except:
+                          continue
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(f'Deleted old indices: {deleted_indices}')
+              }
+
+  # IAM Role for OpenSearch Lambda Functions
+  OpenSearchLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'BitcoinOpenSearchLambdaRole-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCExecutionRole
+      Policies:
+        - PolicyName: OpenSearchAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - es:ESHttpGet
+                  - es:ESHttpHead
+                  - es:ESHttpPost
+                  - es:ESHttpPut
+                  - es:ESHttpDelete
+                Resource: !GetAtt OpenSearchDomain.DomainArn
+              - Effect: Allow
+                Action:
+                  - es:ESHttpGet
+                  - es:ESHttpHead
+                  - es:ESHttpPost
+                  - es:ESHttpPut
+                  - es:ESHttpDelete
+                Resource: !Sub '${OpenSearchDomain.DomainArn}/*'
+
+  # EventBridge Rules for Index Management
+  IndexRotationRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'bitcoin-index-rotation-${Environment}'
+      Description: 'Monthly index rotation for Bitcoin OpenSearch'
+      ScheduleExpression: 'cron(0 0 1 * ? *)'  # First day of month
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt IndexManagementFunction.Arn
+          Id: IndexRotationTarget
+          Input: '{"action": "rotate_indices"}'
+
+  IndexCleanupRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'bitcoin-index-cleanup-${Environment}'
+      Description: 'Cleanup old indices for Bitcoin OpenSearch'
+      ScheduleExpression: 'cron(0 2 15 * ? *)'  # 15th of each month
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt IndexManagementFunction.Arn
+          Id: IndexCleanupTarget
+          Input: '{"action": "cleanup_old_indices"}'
+
+  # Lambda Permissions for EventBridge
+  IndexRotationPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref IndexManagementFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt IndexRotationRule.Arn
+
+  IndexCleanupPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref IndexManagementFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt IndexCleanupRule.Arn
+
+  # CloudWatch Alarms for OpenSearch
+  OpenSearchClusterStatusAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'OpenSearch-ClusterStatus-${Environment}'
+      AlarmDescription: 'OpenSearch cluster status is not green'
+      MetricName: 'ClusterStatus.yellow'
+      Namespace: 'AWS/ES'
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DomainName
+          Value: !Ref OpenSearchDomain
+        - Name: ClientId
+          Value: !Ref 'AWS::AccountId'
+      TreatMissingData: notBreaching
+
+  OpenSearchFreeStorageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'OpenSearch-LowFreeStorage-${Environment}'
+      AlarmDescription: 'OpenSearch cluster has low free storage'
+      MetricName: 'StorageUtilization'
+      Namespace: 'AWS/ES'
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 85
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DomainName
+          Value: !Ref OpenSearchDomain
+        - Name: ClientId
+          Value: !Ref 'AWS::AccountId'
+      TreatMissingData: notBreaching
+
+Outputs:
+  OpenSearchDomainEndpoint:
+    Description: OpenSearch domain endpoint
+    Value: !GetAtt OpenSearchDomain.DomainEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-OpenSearchEndpoint'
+
+  OpenSearchDomainArn:
+    Description: OpenSearch domain ARN
+    Value: !GetAtt OpenSearchDomain.DomainArn
+    Export:
+      Name: !Sub '${AWS::StackName}-OpenSearchArn'
+
+  KibanaDashboardUrl:
+    Description: Kibana dashboard URL
+    Value: !Sub 'https://${OpenSearchDomain.DomainEndpoint}/_dashboards'
+    Export:
+      Name: !Sub '${AWS::StackName}-KibanaUrl'
+
+  IngestionFunctionArn:
+    Description: ARN of the OpenSearch ingestion function
+    Value: !GetAtt OpenSearchIngestionFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-IngestionFunction'
+
+  IndexManagementFunctionArn:
+    Description: ARN of the index management function
+    Value: !GetAtt IndexManagementFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-IndexMgmtFunction'
+
+  OpenSearchSecurityGroupId:
+    Description: Security group ID for OpenSearch cluster
+    Value: !Ref OpenSearchSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-OpenSearchSG'

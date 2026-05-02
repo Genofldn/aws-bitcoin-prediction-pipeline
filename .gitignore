@@ -1,0 +1,35 @@
+# Separate git repositories (push these independently)
+duwjx-tdd_bdd_PracticeCode/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.env
+venv/
+.venv/
+
+# Lambda deployment packages (bundled libraries - not source code)
+**/package/
+**/bitcoin-lambda-working/
+**/minimal-package/
+**/botocore/
+**/boto3/
+*.zip
+
+# Secrets (never commit these)
+*.env
+.env.*
+secrets.yaml
+secrets.yml
+
+# IDE
+.vscode/
+.idea/
+*.swp

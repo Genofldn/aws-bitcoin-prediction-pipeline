@@ -1,0 +1,304 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudWatch Alarms for Bitcoin Prediction Pipeline'
+
+Parameters:
+  AlertsTopicArn:
+    Type: String
+    Description: SNS Topic ARN for alerts
+    Default: !Sub 'arn:aws:sns:${AWS::Region}:${AWS::AccountId}:bitcoin-prediction-alerts'
+
+Resources:
+  # Lambda Function Error Alarms
+  NewsAPICollectorErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: BitcoinPipeline-NewsAPICollector-Errors
+      AlarmDescription: NewsAPI collector function errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: bitcoin-newsapi-collector
+      AlarmActions:
+        - !Ref AlertsTopicArn
+      TreatMissingData: notBreaching
+
+  CryptoCompareCollectorErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: BitcoinPipeline-CryptoCompareCollector-Errors
+      AlarmDescription: CryptoCompare collector function errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: bitcoin-cryptocompare-collector
+      AlarmActions:
+        - !Ref AlertsTopicArn
+      TreatMissingData: notBreaching
+
+  SentimentAnalyzerErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: BitcoinPipeline-SentimentAnalyzer-Errors
+      AlarmDescription: Sentiment analyzer function errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: bitcoin-sentiment-analyzer
+      AlarmActions:
+        - !Ref AlertsTopicArn
+      TreatMissingData: notBreaching
+
+  PredictorErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: BitcoinPipeline-Predictor-Errors
+      AlarmDescription: Predictor function errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: bitcoin-predictor
+      AlarmActions:
+        - !Ref AlertsTopicArn
+      TreatMissingData: notBreaching
+
+  # Lambda Function Duration Alarms
+  NewsAPICollectorDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: BitcoinPipeline-NewsAPICollector-HighDuration
+      AlarmDescription: NewsAPI collector function high duration
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 240000  # 4 minutes (timeout is 5 minutes)
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: bitcoin-newsapi-collector
+      AlarmActions:
+        - !Ref AlertsTopicArn
+      TreatMissingData: notBreaching
+
+  PredictorDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: BitcoinPipeline-Predictor-HighDuration
+      AlarmDescription: Predictor function high duration
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 240000  # 4 minutes
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: bitcoin-predictor
+      AlarmActions:
+        - !Ref AlertsTopicArn
+      TreatMissingData: notBreaching
+
+  # SQS Dead Letter Queue Alarms
+  DataProcessingDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: BitcoinPipeline-DataProcessingDLQ-Messages
+      AlarmDescription: Messages in data processing dead letter queue
+      MetricName: NumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: bitcoin-data-processing-dlq
+      AlarmActions:
+        - !Ref AlertsTopicArn
+      TreatMissingData: notBreaching
+
+  PredictionDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: BitcoinPipeline-PredictionDLQ-Messages
+      AlarmDescription: Messages in prediction dead letter queue
+      MetricName: NumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: bitcoin-prediction-dlq
+      AlarmActions:
+        - !Ref AlertsTopicArn
+      TreatMissingData: notBreaching
+
+  # DynamoDB Throttling Alarms
+  PredictionsTableReadThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: BitcoinPipeline-PredictionsTable-ReadThrottle
+      AlarmDescription: DynamoDB predictions table read throttling
+      MetricName: ReadThrottleCount
+      Namespace: AWS/DynamoDB
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: TableName
+          Value: bitcoin-predictions
+      AlarmActions:
+        - !Ref AlertsTopicArn
+      TreatMissingData: notBreaching
+
+  PredictionsTableWriteThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: BitcoinPipeline-PredictionsTable-WriteThrottle
+      AlarmDescription: DynamoDB predictions table write throttling
+      MetricName: WriteThrottleCount
+      Namespace: AWS/DynamoDB
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: TableName
+          Value: bitcoin-predictions
+      AlarmActions:
+        - !Ref AlertsTopicArn
+      TreatMissingData: notBreaching
+
+  # Custom Metric Alarms
+  DataCollectionFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: BitcoinPipeline-DataCollection-HighFailures
+      AlarmDescription: High number of data collection failures
+      MetricName: NewsAPI.RequestFailures
+      Namespace: Bitcoin/Prediction
+      Statistic: Sum
+      Period: 900  # 15 minutes
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlertsTopicArn
+      TreatMissingData: notBreaching
+
+  LowConfidencePredictionAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: BitcoinPipeline-LowConfidence-Predictions
+      AlarmDescription: Prediction confidence consistently low
+      MetricName: Prediction.ConfidenceScore
+      Namespace: Bitcoin/Prediction
+      Statistic: Average
+      Period: 3600  # 1 hour
+      EvaluationPeriods: 3
+      Threshold: 0.3
+      ComparisonOperator: LessThanThreshold
+      AlarmActions:
+        - !Ref AlertsTopicArn
+      TreatMissingData: breaching
+
+  NoRecentPredictionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: BitcoinPipeline-NoRecent-Predictions
+      AlarmDescription: No predictions generated recently
+      MetricName: Prediction.ConfidenceScore
+      Namespace: Bitcoin/Prediction
+      Statistic: SampleCount
+      Period: 3600  # 1 hour
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      AlarmActions:
+        - !Ref AlertsTopicArn
+      TreatMissingData: breaching
+
+  LowDataQualityAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: BitcoinPipeline-LowDataQuality
+      AlarmDescription: Feature engineering data quality is low
+      MetricName: FeatureEngineering.DataQualityScore
+      Namespace: Bitcoin/Prediction
+      Statistic: Average
+      Period: 3600  # 1 hour
+      EvaluationPeriods: 2
+      Threshold: 0.4
+      ComparisonOperator: LessThanThreshold
+      AlarmActions:
+        - !Ref AlertsTopicArn
+      TreatMissingData: breaching
+
+  # Composite Alarm for Overall System Health
+  SystemHealthCompositeAlarm:
+    Type: AWS::CloudWatch::CompositeAlarm
+    Properties:
+      AlarmName: BitcoinPipeline-SystemHealth-Critical
+      AlarmDescription: Overall system health composite alarm
+      AlarmRule: !Sub |
+        ALARM(${NewsAPICollectorErrorAlarm}) OR
+        ALARM(${CryptoCompareCollectorErrorAlarm}) OR
+        ALARM(${PredictorErrorAlarm}) OR
+        ALARM(${DataProcessingDLQAlarm}) OR
+        ALARM(${PredictionDLQAlarm}) OR
+        ALARM(${NoRecentPredictionsAlarm})
+      AlarmActions:
+        - !Ref AlertsTopicArn
+      TreatMissingData: notBreaching
+
+Outputs:
+  SystemHealthAlarmArn:
+    Description: ARN of the system health composite alarm
+    Value: !Ref SystemHealthCompositeAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-SystemHealthAlarmArn'
+
+  DataCollectionFailureAlarmArn:
+    Description: ARN of the data collection failure alarm
+    Value: !Ref DataCollectionFailureAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-DataCollectionFailureAlarmArn'
+
+  LowConfidencePredictionAlarmArn:
+    Description: ARN of the low confidence prediction alarm
+    Value: !Ref LowConfidencePredictionAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-LowConfidencePredictionAlarmArn'

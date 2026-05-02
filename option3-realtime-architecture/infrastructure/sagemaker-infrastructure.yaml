@@ -1,0 +1,593 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'SageMaker Real-time ML Infrastructure for Bitcoin Predictions'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: 'production'
+    AllowedValues: ['development', 'staging', 'production']
+    Description: Deployment environment
+  
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID for SageMaker endpoints
+  
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnet IDs for SageMaker endpoints (multi-AZ)
+  
+  DataBucketName:
+    Type: String
+    Description: S3 bucket for training data and model artifacts
+
+Resources:
+  # SageMaker Execution Role
+  SageMakerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'BitcoinSageMakerRole-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+      Policies:
+        - PolicyName: S3ModelAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${DataBucketName}'
+                  - !Sub 'arn:aws:s3:::${DataBucketName}/*'
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:ListMetrics
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: '*'
+
+  # Security Group for SageMaker Endpoints
+  SageMakerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub 'sagemaker-endpoints-sg-${Environment}'
+      GroupDescription: Security group for SageMaker real-time endpoints
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+          Description: HTTPS from Lambda functions
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub 'SageMaker-Endpoints-SG-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Security Group for Lambda Functions
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub 'lambda-sagemaker-sg-${Environment}'
+      GroupDescription: Security group for Lambda functions calling SageMaker
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          DestinationSecurityGroupId: !Ref SageMakerSecurityGroup
+          Description: HTTPS to SageMaker endpoints
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS to AWS services
+      Tags:
+        - Key: Name
+          Value: !Sub 'Lambda-SageMaker-SG-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Ensemble Model (XGBoost + Random Forest)
+  EnsembleModel:
+    Type: AWS::SageMaker::Model
+    Properties:
+      ModelName: !Sub 'bitcoin-ensemble-model-${Environment}'
+      ExecutionRoleArn: !GetAtt SageMakerExecutionRole.Arn
+      PrimaryContainer:
+        Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/bitcoin-ensemble:latest'
+        ModelDataUrl: !Sub 's3://${DataBucketName}/models/ensemble/model.tar.gz'
+        Environment:
+          SAGEMAKER_PROGRAM: inference.py
+          SAGEMAKER_SUBMIT_DIRECTORY: /opt/ml/code
+          SAGEMAKER_CONTAINER_LOG_LEVEL: 20
+          SAGEMAKER_REGION: !Ref AWS::Region
+          MODEL_TYPE: ensemble
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref SageMakerSecurityGroup
+        Subnets: !Ref SubnetIds
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ModelType
+          Value: Ensemble
+
+  # Deep Learning Model (LSTM/GRU)
+  DeepLearningModel:
+    Type: AWS::SageMaker::Model
+    Properties:
+      ModelName: !Sub 'bitcoin-deeplearning-model-${Environment}'
+      ExecutionRoleArn: !GetAtt SageMakerExecutionRole.Arn
+      PrimaryContainer:
+        Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/bitcoin-lstm:latest'
+        ModelDataUrl: !Sub 's3://${DataBucketName}/models/deeplearning/model.tar.gz'
+        Environment:
+          SAGEMAKER_PROGRAM: inference.py
+          SAGEMAKER_SUBMIT_DIRECTORY: /opt/ml/code
+          SAGEMAKER_CONTAINER_LOG_LEVEL: 20
+          SAGEMAKER_REGION: !Ref AWS::Region
+          MODEL_TYPE: deeplearning
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref SageMakerSecurityGroup
+        Subnets: !Ref SubnetIds
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ModelType
+          Value: DeepLearning
+
+  # Sentiment Analysis Model (BERT-based)
+  SentimentModel:
+    Type: AWS::SageMaker::Model
+    Properties:
+      ModelName: !Sub 'bitcoin-sentiment-model-${Environment}'
+      ExecutionRoleArn: !GetAtt SageMakerExecutionRole.Arn
+      PrimaryContainer:
+        Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/bitcoin-sentiment:latest'
+        ModelDataUrl: !Sub 's3://${DataBucketName}/models/sentiment/model.tar.gz'
+        Environment:
+          SAGEMAKER_PROGRAM: inference.py
+          SAGEMAKER_SUBMIT_DIRECTORY: /opt/ml/code
+          SAGEMAKER_CONTAINER_LOG_LEVEL: 20
+          SAGEMAKER_REGION: !Ref AWS::Region
+          MODEL_TYPE: sentiment
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref SageMakerSecurityGroup
+        Subnets: !Ref SubnetIds
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ModelType
+          Value: Sentiment
+
+  # Time Series Model (ARIMA/Prophet)
+  TimeSeriesModel:
+    Type: AWS::SageMaker::Model
+    Properties:
+      ModelName: !Sub 'bitcoin-timeseries-model-${Environment}'
+      ExecutionRoleArn: !GetAtt SageMakerExecutionRole.Arn
+      PrimaryContainer:
+        Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/bitcoin-timeseries:latest'
+        ModelDataUrl: !Sub 's3://${DataBucketName}/models/timeseries/model.tar.gz'
+        Environment:
+          SAGEMAKER_PROGRAM: inference.py
+          SAGEMAKER_SUBMIT_DIRECTORY: /opt/ml/code
+          SAGEMAKER_CONTAINER_LOG_LEVEL: 20
+          SAGEMAKER_REGION: !Ref AWS::Region
+          MODEL_TYPE: timeseries
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref SageMakerSecurityGroup
+        Subnets: !Ref SubnetIds
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ModelType
+          Value: TimeSeries
+
+  # Endpoint Configurations
+  EnsembleEndpointConfig:
+    Type: AWS::SageMaker::EndpointConfig
+    Properties:
+      EndpointConfigName: !Sub 'bitcoin-ensemble-config-${Environment}'
+      ProductionVariants:
+        - VariantName: primary
+          ModelName: !GetAtt EnsembleModel.ModelName
+          InitialInstanceCount: 2
+          InstanceType: ml.m5.xlarge
+          InitialVariantWeight: 100
+          AcceleratorType: ml.eia1.medium  # Elastic Inference for cost optimization
+        - VariantName: challenger
+          ModelName: !GetAtt EnsembleModel.ModelName
+          InitialInstanceCount: 1
+          InstanceType: ml.m5.large
+          InitialVariantWeight: 0  # Start with 0% traffic for A/B testing
+      DataCaptureConfig:
+        EnableCapture: true
+        InitialSamplingPercentage: 100
+        DestinationS3Uri: !Sub 's3://${DataBucketName}/model-monitoring/ensemble/'
+        CaptureOptions:
+          - CaptureMode: Input
+          - CaptureMode: Output
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ModelType
+          Value: Ensemble
+
+  DeepLearningEndpointConfig:
+    Type: AWS::SageMaker::EndpointConfig
+    Properties:
+      EndpointConfigName: !Sub 'bitcoin-deeplearning-config-${Environment}'
+      ProductionVariants:
+        - VariantName: primary
+          ModelName: !GetAtt DeepLearningModel.ModelName
+          InitialInstanceCount: 2
+          InstanceType: ml.g4dn.xlarge  # GPU instance for deep learning
+          InitialVariantWeight: 100
+      DataCaptureConfig:
+        EnableCapture: true
+        InitialSamplingPercentage: 50
+        DestinationS3Uri: !Sub 's3://${DataBucketName}/model-monitoring/deeplearning/'
+        CaptureOptions:
+          - CaptureMode: Input
+          - CaptureMode: Output
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ModelType
+          Value: DeepLearning
+
+  SentimentEndpointConfig:
+    Type: AWS::SageMaker::EndpointConfig
+    Properties:
+      EndpointConfigName: !Sub 'bitcoin-sentiment-config-${Environment}'
+      ProductionVariants:
+        - VariantName: primary
+          ModelName: !GetAtt SentimentModel.ModelName
+          InitialInstanceCount: 1
+          InstanceType: ml.m5.large
+          InitialVariantWeight: 100
+      DataCaptureConfig:
+        EnableCapture: true
+        InitialSamplingPercentage: 25
+        DestinationS3Uri: !Sub 's3://${DataBucketName}/model-monitoring/sentiment/'
+        CaptureOptions:
+          - CaptureMode: Input
+          - CaptureMode: Output
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ModelType
+          Value: Sentiment
+
+  TimeSeriesEndpointConfig:
+    Type: AWS::SageMaker::EndpointConfig
+    Properties:
+      EndpointConfigName: !Sub 'bitcoin-timeseries-config-${Environment}'
+      ProductionVariants:
+        - VariantName: primary
+          ModelName: !GetAtt TimeSeriesModel.ModelName
+          InitialInstanceCount: 1
+          InstanceType: ml.m5.large
+          InitialVariantWeight: 100
+      DataCaptureConfig:
+        EnableCapture: true
+        InitialSamplingPercentage: 25
+        DestinationS3Uri: !Sub 's3://${DataBucketName}/model-monitoring/timeseries/'
+        CaptureOptions:
+          - CaptureMode: Input
+          - CaptureMode: Output
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ModelType
+          Value: TimeSeries
+
+  # Real-time Endpoints
+  EnsembleEndpoint:
+    Type: AWS::SageMaker::Endpoint
+    Properties:
+      EndpointName: !Sub 'bitcoin-ensemble-endpoint-${Environment}'
+      EndpointConfigName: !GetAtt EnsembleEndpointConfig.EndpointConfigName
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ModelType
+          Value: Ensemble
+        - Key: CriticalComponent
+          Value: 'true'
+
+  DeepLearningEndpoint:
+    Type: AWS::SageMaker::Endpoint
+    Properties:
+      EndpointName: !Sub 'bitcoin-deeplearning-endpoint-${Environment}'
+      EndpointConfigName: !GetAtt DeepLearningEndpointConfig.EndpointConfigName
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ModelType
+          Value: DeepLearning
+        - Key: CriticalComponent
+          Value: 'true'
+
+  SentimentEndpoint:
+    Type: AWS::SageMaker::Endpoint
+    Properties:
+      EndpointName: !Sub 'bitcoin-sentiment-endpoint-${Environment}'
+      EndpointConfigName: !GetAtt SentimentEndpointConfig.EndpointConfigName
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ModelType
+          Value: Sentiment
+
+  TimeSeriesEndpoint:
+    Type: AWS::SageMaker::Endpoint
+    Properties:
+      EndpointName: !Sub 'bitcoin-timeseries-endpoint-${Environment}'
+      EndpointConfigName: !GetAtt TimeSeriesEndpointConfig.EndpointConfigName
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ModelType
+          Value: TimeSeries
+
+  # Model Monitoring Data Quality Job Definition
+  ModelDataQualityJobDefinition:
+    Type: AWS::SageMaker::DataQualityJobDefinition
+    Properties:
+      JobDefinitionName: !Sub 'bitcoin-data-quality-${Environment}'
+      DataQualityAppSpecification:
+        ImageUri: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/sagemaker-model-monitor-analyzer'
+      DataQualityJobInput:
+        EndpointInput:
+          EndpointName: !GetAtt EnsembleEndpoint.EndpointName
+          LocalPath: /opt/ml/processing/input/endpoint
+      DataQualityJobOutputConfig:
+        MonitoringOutputs:
+          - S3Output:
+              S3Uri: !Sub 's3://${DataBucketName}/model-monitoring/data-quality'
+              LocalPath: /opt/ml/processing/output
+      RoleArn: !GetAtt SageMakerExecutionRole.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Model Quality Monitoring Job Definition
+  ModelQualityJobDefinition:
+    Type: AWS::SageMaker::ModelQualityJobDefinition
+    Properties:
+      JobDefinitionName: !Sub 'bitcoin-model-quality-${Environment}'
+      ModelQualityAppSpecification:
+        ImageUri: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/sagemaker-model-monitor-analyzer'
+        ProblemType: Regression
+      ModelQualityJobInput:
+        EndpointInput:
+          EndpointName: !GetAtt EnsembleEndpoint.EndpointName
+          LocalPath: /opt/ml/processing/input/endpoint
+        GroundTruthS3Input:
+          S3Uri: !Sub 's3://${DataBucketName}/ground-truth/'
+      ModelQualityJobOutputConfig:
+        MonitoringOutputs:
+          - S3Output:
+              S3Uri: !Sub 's3://${DataBucketName}/model-monitoring/model-quality'
+              LocalPath: /opt/ml/processing/output
+      RoleArn: !GetAtt SageMakerExecutionRole.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Model Bias Monitoring Job Definition
+  ModelBiasJobDefinition:
+    Type: AWS::SageMaker::ModelBiasJobDefinition
+    Properties:
+      JobDefinitionName: !Sub 'bitcoin-model-bias-${Environment}'
+      ModelBiasAppSpecification:
+        ImageUri: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/sagemaker-clarify-processing'
+        ConfigUri: !Sub 's3://${DataBucketName}/bias-config/analysis_config.json'
+      ModelBiasJobInput:
+        EndpointInput:
+          EndpointName: !GetAtt EnsembleEndpoint.EndpointName
+          LocalPath: /opt/ml/processing/input/endpoint
+      ModelBiasJobOutputConfig:
+        MonitoringOutputs:
+          - S3Output:
+              S3Uri: !Sub 's3://${DataBucketName}/model-monitoring/bias'
+              LocalPath: /opt/ml/processing/output
+      RoleArn: !GetAtt SageMakerExecutionRole.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Monitoring Schedules
+  DataQualityMonitoringSchedule:
+    Type: AWS::SageMaker::MonitoringSchedule
+    Properties:
+      MonitoringScheduleName: !Sub 'bitcoin-data-quality-schedule-${Environment}'
+      MonitoringScheduleConfig:
+        MonitoringJobDefinitionName: !Ref ModelDataQualityJobDefinition
+        ScheduleConfig:
+          ScheduleExpression: 'cron(0 */6 * * ? *)'  # Every 6 hours
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  ModelQualityMonitoringSchedule:
+    Type: AWS::SageMaker::MonitoringSchedule
+    Properties:
+      MonitoringScheduleName: !Sub 'bitcoin-model-quality-schedule-${Environment}'
+      MonitoringScheduleConfig:
+        MonitoringJobDefinitionName: !Ref ModelQualityJobDefinition
+        ScheduleConfig:
+          ScheduleExpression: 'cron(0 0 * * ? *)'  # Daily
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Auto Scaling for Endpoints
+  EnsembleEndpointAutoScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      ServiceNamespace: sagemaker
+      ResourceId: !Sub 'endpoint/${EnsembleEndpoint.EndpointName}/variant/primary'
+      ScalableDimension: sagemaker:variant:DesiredInstanceCount
+      MinCapacity: 1
+      MaxCapacity: 10
+      RoleARN: !GetAtt AutoScalingRole.Arn
+
+  EnsembleEndpointAutoScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub 'bitcoin-ensemble-scaling-policy-${Environment}'
+      PolicyType: TargetTrackingScaling
+      ServiceNamespace: sagemaker
+      ResourceId: !Sub 'endpoint/${EnsembleEndpoint.EndpointName}/variant/primary'
+      ScalableDimension: sagemaker:variant:DesiredInstanceCount
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 70.0
+        PredefinedMetricSpecification:
+          PredefinedMetricType: SageMakerVariantInvocationsPerInstance
+        ScaleOutCooldown: 300
+        ScaleInCooldown: 300
+
+  # Auto Scaling Role
+  AutoScalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'SageMakerAutoScalingRole-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: application-autoscaling.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SageMakerAutoScalingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sagemaker:DescribeEndpoint
+                  - sagemaker:DescribeEndpointConfig
+                  - sagemaker:UpdateEndpointWeightsAndCapacities
+                  - cloudwatch:PutMetricData
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:DescribeAlarms
+                Resource: '*'
+
+  # CloudWatch Alarms for Model Performance
+  EnsembleModelLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'SageMaker-EnsembleModel-HighLatency-${Environment}'
+      AlarmDescription: 'Ensemble model experiencing high latency'
+      MetricName: ModelLatency
+      Namespace: AWS/SageMaker
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 50  # 50ms
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: EndpointName
+          Value: !Ref EnsembleEndpoint
+        - Name: VariantName
+          Value: primary
+      TreatMissingData: notBreaching
+
+  EnsembleModelErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'SageMaker-EnsembleModel-HighErrorRate-${Environment}'
+      AlarmDescription: 'Ensemble model experiencing high error rate'
+      MetricName: ModelInvocation4XXErrors
+      Namespace: AWS/SageMaker
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: EndpointName
+          Value: !Ref EnsembleEndpoint
+        - Name: VariantName
+          Value: primary
+      TreatMissingData: notBreaching
+
+Outputs:
+  EnsembleEndpointName:
+    Description: Name of the ensemble model endpoint
+    Value: !Ref EnsembleEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-EnsembleEndpoint'
+
+  DeepLearningEndpointName:
+    Description: Name of the deep learning model endpoint
+    Value: !Ref DeepLearningEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-DeepLearningEndpoint'
+
+  SentimentEndpointName:
+    Description: Name of the sentiment analysis endpoint
+    Value: !Ref SentimentEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-SentimentEndpoint'
+
+  TimeSeriesEndpointName:
+    Description: Name of the time series model endpoint
+    Value: !Ref TimeSeriesEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-TimeSeriesEndpoint'
+
+  SageMakerExecutionRoleArn:
+    Description: ARN of the SageMaker execution role
+    Value: !GetAtt SageMakerExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SageMakerRole'
+
+  SageMakerSecurityGroupId:
+    Description: Security group ID for SageMaker endpoints
+    Value: !Ref SageMakerSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-SageMakerSG'
+
+  LambdaSecurityGroupId:
+    Description: Security group ID for Lambda functions
+    Value: !Ref LambdaSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaSG'

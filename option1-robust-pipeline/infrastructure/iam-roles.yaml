@@ -1,0 +1,229 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'IAM Roles and Policies for Bitcoin Prediction Pipeline'
+
+Resources:
+  # Lambda Execution Role
+  BitcoinLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: BitcoinLambdaExecutionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BitcoinPipelinePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # SQS Permissions
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:GetQueueUrl
+                Resource:
+                  - !Sub 'arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:bitcoin-*'
+              
+              # DynamoDB Permissions
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:BatchGetItem
+                  - dynamodb:BatchWriteItem
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/bitcoin-*'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/bitcoin-*/index/*'
+              
+              # S3 Permissions
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::bitcoin-prediction-data-${AWS::AccountId}'
+                  - !Sub 'arn:aws:s3:::bitcoin-prediction-data-${AWS::AccountId}/*'
+              
+              # Systems Manager Parameter Store
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:GetParametersByPath
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/bitcoin/*'
+              
+              # CloudWatch Logs (additional permissions)
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/bitcoin-*'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/bitcoin-*:*'
+              
+              # CloudWatch Metrics
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:ListMetrics
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'cloudwatch:namespace': 'Bitcoin/Prediction'
+
+  # QuickSight Service Role
+  BitcoinQuickSightRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: BitcoinQuickSightRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: quicksight.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: QuickSightDynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:DescribeTable
+                  - dynamodb:ListTables
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:GetItem
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/bitcoin-predictions'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/bitcoin-predictions/index/*'
+        - PolicyName: QuickSightS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::bitcoin-prediction-data-${AWS::AccountId}'
+                  - !Sub 'arn:aws:s3:::bitcoin-prediction-data-${AWS::AccountId}/*'
+
+  # EventBridge Service Role (if needed for cross-account access)
+  BitcoinEventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: BitcoinEventBridgeRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EventBridgeLambdaInvoke
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:bitcoin-*'
+
+  # CloudWatch Alarms Role
+  BitcoinCloudWatchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: BitcoinCloudWatchRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudWatchAlarmActions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                  - lambda:InvokeFunction
+                  - autoscaling:ExecutePolicy
+                Resource:
+                  - !Sub 'arn:aws:sns:${AWS::Region}:${AWS::AccountId}:bitcoin-*'
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:bitcoin-*'
+
+  # SNS Topic for Alerts
+  BitcoinAlertsSnsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: bitcoin-prediction-alerts
+      DisplayName: Bitcoin Prediction Pipeline Alerts
+
+  # SNS Topic Policy
+  BitcoinAlertsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref BitcoinAlertsSnsTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action:
+              - sns:Publish
+            Resource: !Ref BitcoinAlertsSnsTopic
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action:
+              - sns:Subscribe
+              - sns:Unsubscribe
+              - sns:Publish
+            Resource: !Ref BitcoinAlertsSnsTopic
+
+Outputs:
+  LambdaExecutionRoleArn:
+    Description: ARN of the Lambda execution role
+    Value: !GetAtt BitcoinLambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaExecutionRoleArn'
+
+  QuickSightRoleArn:
+    Description: ARN of the QuickSight role
+    Value: !GetAtt BitcoinQuickSightRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-QuickSightRoleArn'
+
+  AlertsTopicArn:
+    Description: ARN of the SNS alerts topic
+    Value: !Ref BitcoinAlertsSnsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-AlertsTopicArn'

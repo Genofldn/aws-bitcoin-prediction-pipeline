@@ -1,0 +1,223 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Simple Bitcoin Prediction Pipeline Infrastructure'
+
+Parameters:
+  NewsApiKey:
+    Type: String
+    Description: NewsAPI Key
+    NoEcho: true
+  
+  CryptoCompareApiKey:
+    Type: String
+    Description: CryptoCompare API Key
+    NoEcho: true
+
+Resources:
+  # S3 Bucket for storing predictions
+  BitcoinPredictionsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'bitcoin-simple-predictions-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldPredictions
+            Status: Enabled
+            ExpirationInDays: 90
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      # S3 notifications removed due to CloudFormation limitations
+
+  # CloudWatch Log Group
+  PredictionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: '/aws/lambda/bitcoin-simple-predictor'
+      RetentionInDays: 14
+
+  # Lambda Function
+  BitcoinPredictorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: bitcoin-simple-predictor
+      Runtime: python3.11
+      Handler: bitcoin-predictor-simple.lambda_handler
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              return {'statusCode': 200, 'body': 'Function placeholder - deploy code separately'}
+      Timeout: 300
+      MemorySize: 256
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref BitcoinPredictionsBucket
+          NEWSAPI_KEY: !Ref NewsApiKey
+          CRYPTOCOMPARE_KEY: !Ref CryptoCompareApiKey
+      DeadLetterConfig:
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+
+  # SQS Dead Letter Queue (for failed executions)
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: bitcoin-simple-predictor-dlq
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  # EventBridge Rule for Scheduling
+  PredictionSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: bitcoin-simple-prediction-schedule
+      Description: Trigger Bitcoin prediction every 5 minutes
+      ScheduleExpression: rate(5 minutes)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt BitcoinPredictorFunction.Arn
+          Id: BitcoinPredictorTarget
+
+  # Lambda Permission for EventBridge
+  PredictionSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BitcoinPredictorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt PredictionSchedule.Arn
+
+  # IAM Role for Lambda
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: BitcoinSimplePredictorRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${BitcoinPredictionsBucket}/*'
+                  - !GetAtt BitcoinPredictionsBucket.Arn
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt DeadLetterQueue.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/bitcoin-simple-predictor:*'
+
+  # Basic CloudWatch Alarms
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: BitcoinSimplePredictor-Errors
+      AlarmDescription: Lambda function errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref BitcoinPredictorFunction
+      TreatMissingData: notBreaching
+
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: BitcoinSimplePredictor-HighDuration
+      AlarmDescription: Lambda function high duration
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 240000  # 4 minutes
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref BitcoinPredictorFunction
+      TreatMissingData: notBreaching
+
+  # Cost Budget Alert
+  CostBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: Bitcoin-Simple-Pipeline-Budget
+        BudgetLimit:
+          Amount: 15
+          Unit: USD
+        TimeUnit: MONTHLY
+        BudgetType: COST
+        CostFilters:
+          Service:
+            - Amazon Simple Storage Service
+            - AWS Lambda
+            - Amazon CloudWatch
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: admin@example.com  # Replace with your email
+
+Outputs:
+  S3BucketName:
+    Description: Name of the S3 bucket for predictions
+    Value: !Ref BitcoinPredictionsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-S3BucketName'
+
+  LambdaFunctionName:
+    Description: Name of the Lambda function
+    Value: !Ref BitcoinPredictorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionName'
+
+  LambdaFunctionArn:
+    Description: ARN of the Lambda function
+    Value: !GetAtt BitcoinPredictorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  DeadLetterQueueUrl:
+    Description: URL of the dead letter queue
+    Value: !Ref DeadLetterQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-DeadLetterQueueUrl'
+
+  ScheduleRuleName:
+    Description: Name of the EventBridge schedule rule
+    Value: !Ref PredictionSchedule
+    Export:
+      Name: !Sub '${AWS::StackName}-ScheduleRuleName'

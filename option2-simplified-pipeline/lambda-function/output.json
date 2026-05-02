@@ -1,0 +1,1 @@
+{"statusCode": 200, "body": "{\"success\": true, \"current_price\": 107342.51, \"predictions\": {\"1h\": 107271.58493571734, \"6h\": 107165.19733929334, \"24h\": 106633.25935717339, \"7d\": 105924.0087143468}, \"confidence\": 0.647, \"s3_saved\": true, \"processing_time\": 1.7}"}

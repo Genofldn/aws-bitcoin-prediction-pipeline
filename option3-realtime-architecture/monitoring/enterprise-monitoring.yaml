@@ -1,0 +1,798 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Enterprise-grade monitoring and alerting for Real-time Bitcoin Prediction System'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: 'production'
+    AllowedValues: ['development', 'staging', 'production']
+    Description: Deployment environment
+  
+  NotificationEmail:
+    Type: String
+    Description: Email address for critical alerts
+    Default: 'admin@example.com'
+  
+  SlackWebhookUrl:
+    Type: String
+    Description: Slack webhook URL for notifications (optional)
+    Default: ''
+    NoEcho: true
+  
+  PagerDutyIntegrationKey:
+    Type: String
+    Description: PagerDuty integration key for critical alerts (optional)
+    Default: ''
+    NoEcho: true
+
+Conditions:
+  HasSlackWebhook: !Not [!Equals [!Ref SlackWebhookUrl, '']]
+  HasPagerDuty: !Not [!Equals [!Ref PagerDutyIntegrationKey, '']]
+  IsProduction: !Equals [!Ref Environment, 'production']
+
+Resources:
+  # SNS Topics for Different Alert Levels
+  CriticalAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'bitcoin-critical-alerts-${Environment}'
+      DisplayName: 'Bitcoin System Critical Alerts'
+
+  WarningAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'bitcoin-warning-alerts-${Environment}'
+      DisplayName: 'Bitcoin System Warning Alerts'
+
+  InfoAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'bitcoin-info-alerts-${Environment}'
+      DisplayName: 'Bitcoin System Info Alerts'
+
+  # Email Subscriptions
+  CriticalEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref CriticalAlertsTopic
+      Endpoint: !Ref NotificationEmail
+
+  WarningEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref WarningAlertsTopic
+      Endpoint: !Ref NotificationEmail
+
+  # Lambda Function for Enhanced Notifications
+  NotificationEnhancerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'bitcoin-notification-enhancer-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      MemorySize: 256
+      Timeout: 60
+      Role: !GetAtt NotificationLambdaRole.Arn
+      Environment:
+        Variables:
+          SLACK_WEBHOOK_URL: !Ref SlackWebhookUrl
+          PAGERDUTY_INTEGRATION_KEY: !Ref PagerDutyIntegrationKey
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import urllib3
+          import os
+          from datetime import datetime, timezone
+
+          http = urllib3.PoolManager()
+
+          def lambda_handler(event, context):
+              for record in event['Records']:
+                  if 'Sns' in record:
+                      process_sns_message(record['Sns'])
+              
+              return {'statusCode': 200}
+
+          def process_sns_message(sns_message):
+              subject = sns_message.get('Subject', 'Alert')
+              message = sns_message.get('Message', '')
+              topic_arn = sns_message.get('TopicArn', '')
+              
+              # Parse CloudWatch alarm if present
+              try:
+                  alarm_data = json.loads(message)
+                  if 'AlarmName' in alarm_data:
+                      send_enhanced_notifications(alarm_data, topic_arn)
+                      return
+              except:
+                  pass
+              
+              # Send as general notification
+              send_general_notification(subject, message, topic_arn)
+
+          def send_enhanced_notifications(alarm_data, topic_arn):
+              alarm_name = alarm_data.get('AlarmName', 'Unknown')
+              alarm_state = alarm_data.get('NewStateValue', 'UNKNOWN')
+              alarm_reason = alarm_data.get('NewStateReason', '')
+              timestamp = alarm_data.get('StateChangeTime', datetime.now(timezone.utc).isoformat())
+              
+              # Determine severity
+              severity = get_alert_severity(topic_arn, alarm_name)
+              
+              # Send to Slack
+              if os.environ.get('SLACK_WEBHOOK_URL'):
+                  send_slack_notification(alarm_name, alarm_state, alarm_reason, severity, timestamp)
+              
+              # Send to PagerDuty for critical alerts
+              if severity == 'critical' and os.environ.get('PAGERDUTY_INTEGRATION_KEY'):
+                  send_pagerduty_alert(alarm_name, alarm_state, alarm_reason, timestamp)
+
+          def get_alert_severity(topic_arn, alarm_name):
+              if 'critical' in topic_arn.lower():
+                  return 'critical'
+              elif 'warning' in topic_arn.lower():
+                  return 'warning'
+              elif any(keyword in alarm_name.lower() for keyword in ['error', 'failure', 'down', 'outage']):
+                  return 'critical'
+              else:
+                  return 'info'
+
+          def send_slack_notification(alarm_name, state, reason, severity, timestamp):
+              color_map = {'critical': 'danger', 'warning': 'warning', 'info': 'good'}
+              emoji_map = {'critical': '🚨', 'warning': '⚠️', 'info': 'ℹ️'}
+              
+              payload = {
+                  'text': f"{emoji_map.get(severity, '📊')} Bitcoin System Alert",
+                  'attachments': [{
+                      'color': color_map.get(severity, 'good'),
+                      'fields': [
+                          {'title': 'Alarm', 'value': alarm_name, 'short': True},
+                          {'title': 'State', 'value': state, 'short': True},
+                          {'title': 'Reason', 'value': reason, 'short': False},
+                          {'title': 'Environment', 'value': os.environ.get('ENVIRONMENT', 'unknown'), 'short': True},
+                          {'title': 'Time', 'value': timestamp, 'short': True}
+                      ]
+                  }]
+              }
+              
+              try:
+                  response = http.request(
+                      'POST',
+                      os.environ['SLACK_WEBHOOK_URL'],
+                      body=json.dumps(payload),
+                      headers={'Content-Type': 'application/json'}
+                  )
+                  print(f"Slack notification sent: {response.status}")
+              except Exception as e:
+                  print(f"Failed to send Slack notification: {str(e)}")
+
+          def send_pagerduty_alert(alarm_name, state, reason, timestamp):
+              payload = {
+                  'routing_key': os.environ['PAGERDUTY_INTEGRATION_KEY'],
+                  'event_action': 'trigger' if state == 'ALARM' else 'resolve',
+                  'dedup_key': f"bitcoin-{alarm_name}",
+                  'payload': {
+                      'summary': f"Bitcoin System Alert: {alarm_name}",
+                      'source': 'bitcoin-monitoring',
+                      'severity': 'critical',
+                      'timestamp': timestamp,
+                      'custom_details': {
+                          'alarm_name': alarm_name,
+                          'state': state,
+                          'reason': reason,
+                          'environment': os.environ.get('ENVIRONMENT', 'unknown')
+                      }
+                  }
+              }
+              
+              try:
+                  response = http.request(
+                      'POST',
+                      'https://events.pagerduty.com/v2/enqueue',
+                      body=json.dumps(payload),
+                      headers={'Content-Type': 'application/json'}
+                  )
+                  print(f"PagerDuty alert sent: {response.status}")
+              except Exception as e:
+                  print(f"Failed to send PagerDuty alert: {str(e)}")
+
+          def send_general_notification(subject, message, topic_arn):
+              # Handle general notifications
+              if os.environ.get('SLACK_WEBHOOK_URL'):
+                  payload = {
+                      'text': f"📊 Bitcoin System Notification",
+                      'attachments': [{
+                          'color': 'good',
+                          'fields': [
+                              {'title': 'Subject', 'value': subject, 'short': False},
+                              {'title': 'Message', 'value': message[:500], 'short': False}
+                          ]
+                      }]
+                  }
+                  
+                  try:
+                      http.request(
+                          'POST',
+                          os.environ['SLACK_WEBHOOK_URL'],
+                          body=json.dumps(payload),
+                          headers={'Content-Type': 'application/json'}
+                      )
+                  except Exception as e:
+                      print(f"Failed to send general Slack notification: {str(e)}")
+
+  # SNS Subscriptions for Lambda
+  CriticalLambdaSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: lambda
+      TopicArn: !Ref CriticalAlertsTopic
+      Endpoint: !GetAtt NotificationEnhancerFunction.Arn
+
+  WarningLambdaSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: lambda
+      TopicArn: !Ref WarningAlertsTopic
+      Endpoint: !GetAtt NotificationEnhancerFunction.Arn
+
+  # Lambda Permissions
+  CriticalLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref NotificationEnhancerFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref CriticalAlertsTopic
+
+  WarningLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref NotificationEnhancerFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref WarningAlertsTopic
+
+  # IAM Role for Notification Lambda
+  NotificationLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'BitcoinNotificationLambdaRole-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  # ============================================================================
+  # KINESIS MONITORING
+  # ============================================================================
+
+  # Kinesis Stream Iterator Age Alarm
+  KinesisIteratorAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'Bitcoin-Kinesis-HighIteratorAge-${Environment}'
+      AlarmDescription: 'Kinesis stream has high iterator age (processing lag)'
+      MetricName: GetRecords.IteratorAgeMilliseconds
+      Namespace: AWS/Kinesis
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 60000  # 1 minute
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref CriticalAlertsTopic
+      TreatMissingData: notBreaching
+
+  # Kinesis Incoming Records Alarm
+  KinesisIncomingRecordsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'Bitcoin-Kinesis-LowIncomingRecords-${Environment}'
+      AlarmDescription: 'Kinesis stream receiving insufficient data'
+      MetricName: IncomingRecords
+      Namespace: AWS/Kinesis
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 10
+      ComparisonOperator: LessThanThreshold
+      AlarmActions:
+        - !Ref WarningAlertsTopic
+      TreatMissingData: breaching
+
+  # ============================================================================
+  # SAGEMAKER MONITORING
+  # ============================================================================
+
+  # SageMaker Endpoint Invocation Errors
+  SageMakerErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'Bitcoin-SageMaker-HighErrorRate-${Environment}'
+      AlarmDescription: 'SageMaker endpoint experiencing high error rate'
+      MetricName: Invocation4XXErrors
+      Namespace: AWS/SageMaker
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref CriticalAlertsTopic
+      TreatMissingData: notBreaching
+
+  # SageMaker Model Latency Alarm
+  SageMakerLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'Bitcoin-SageMaker-HighLatency-${Environment}'
+      AlarmDescription: 'SageMaker endpoint experiencing high latency'
+      MetricName: ModelLatency
+      Namespace: AWS/SageMaker
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 1000  # 1 second
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref WarningAlertsTopic
+      TreatMissingData: notBreaching
+
+  # SageMaker Invocation Rate Alarm
+  SageMakerInvocationRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'Bitcoin-SageMaker-LowInvocations-${Environment}'
+      AlarmDescription: 'SageMaker endpoint receiving too few invocations'
+      MetricName: Invocations
+      Namespace: AWS/SageMaker
+      Statistic: Sum
+      Period: 600
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: LessThanThreshold
+      AlarmActions:
+        - !Ref WarningAlertsTopic
+      TreatMissingData: breaching
+
+  # ============================================================================
+  # API GATEWAY MONITORING
+  # ============================================================================
+
+  # API Gateway 4XX Errors
+  APIGateway4XXErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'Bitcoin-APIGateway-High4XXErrors-${Environment}'
+      AlarmDescription: 'API Gateway experiencing high 4XX error rate'
+      MetricName: 4XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 20
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref WarningAlertsTopic
+      TreatMissingData: notBreaching
+
+  # API Gateway 5XX Errors
+  APIGateway5XXErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'Bitcoin-APIGateway-High5XXErrors-${Environment}'
+      AlarmDescription: 'API Gateway experiencing high 5XX error rate'
+      MetricName: 5XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref CriticalAlertsTopic
+      TreatMissingData: notBreaching
+
+  # API Gateway Latency
+  APIGatewayLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'Bitcoin-APIGateway-HighLatency-${Environment}'
+      AlarmDescription: 'API Gateway experiencing high latency'
+      MetricName: Latency
+      Namespace: AWS/ApiGateway
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 5000  # 5 seconds
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref WarningAlertsTopic
+      TreatMissingData: notBreaching
+
+  # ============================================================================
+  # LAMBDA MONITORING
+  # ============================================================================
+
+  # Lambda Error Rate Alarm
+  LambdaErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'Bitcoin-Lambda-HighErrorRate-${Environment}'
+      AlarmDescription: 'Lambda functions experiencing high error rate'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref CriticalAlertsTopic
+      TreatMissingData: notBreaching
+
+  # Lambda Duration Alarm
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'Bitcoin-Lambda-HighDuration-${Environment}'
+      AlarmDescription: 'Lambda functions taking too long to execute'
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 10000  # 10 seconds
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref WarningAlertsTopic
+      TreatMissingData: notBreaching
+
+  # Lambda Throttle Alarm
+  LambdaThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'Bitcoin-Lambda-Throttles-${Environment}'
+      AlarmDescription: 'Lambda functions being throttled'
+      MetricName: Throttles
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref CriticalAlertsTopic
+      TreatMissingData: notBreaching
+
+  # ============================================================================
+  # OPENSEARCH MONITORING
+  # ============================================================================
+
+  # OpenSearch Cluster Status
+  OpenSearchClusterStatusAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'Bitcoin-OpenSearch-ClusterStatus-${Environment}'
+      AlarmDescription: 'OpenSearch cluster status is not green'
+      MetricName: 'ClusterStatus.red'
+      Namespace: 'AWS/ES'
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref CriticalAlertsTopic
+      TreatMissingData: notBreaching
+
+  # OpenSearch Storage Utilization
+  OpenSearchStorageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'Bitcoin-OpenSearch-HighStorageUse-${Environment}'
+      AlarmDescription: 'OpenSearch cluster storage utilization is high'
+      MetricName: 'StorageUtilization'
+      Namespace: 'AWS/ES'
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 85
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref WarningAlertsTopic
+      TreatMissingData: notBreaching
+
+  # ============================================================================
+  # ELASTICACHE MONITORING
+  # ============================================================================
+
+  # ElastiCache CPU Utilization
+  ElastiCacheCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'Bitcoin-ElastiCache-HighCPU-${Environment}'
+      AlarmDescription: 'ElastiCache cluster experiencing high CPU usage'
+      MetricName: CPUUtilization
+      Namespace: AWS/ElastiCache
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref WarningAlertsTopic
+      TreatMissingData: notBreaching
+
+  # ElastiCache Memory Usage
+  ElastiCacheMemoryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'Bitcoin-ElastiCache-HighMemoryUse-${Environment}'
+      AlarmDescription: 'ElastiCache cluster experiencing high memory usage'
+      MetricName: DatabaseMemoryUsagePercentage
+      Namespace: AWS/ElastiCache
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 85
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref WarningAlertsTopic
+      TreatMissingData: notBreaching
+
+  # ============================================================================
+  # CUSTOM METRICS AND DASHBOARDS
+  # ============================================================================
+
+  # Custom Metric: Data Pipeline Health
+  DataPipelineHealthMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: '/aws/lambda/bitcoin-data-ingestion'
+      FilterPattern: '[timestamp, requestId="ERROR"]'
+      MetricTransformations:
+        - MetricNamespace: 'Bitcoin/Pipeline'
+          MetricName: 'DataPipelineErrors'
+          MetricValue: '1'
+          DefaultValue: 0
+
+  # Custom Metric: Prediction Accuracy
+  PredictionAccuracyMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: '/aws/lambda/bitcoin-prediction-evaluator'
+      FilterPattern: '[timestamp, requestId, level="INFO", message="Accuracy:", accuracy]'
+      MetricTransformations:
+        - MetricNamespace: 'Bitcoin/ML'
+          MetricName: 'PredictionAccuracy'
+          MetricValue: '$accuracy'
+          DefaultValue: 0
+
+  # Data Pipeline Health Alarm
+  DataPipelineHealthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'Bitcoin-DataPipeline-Errors-${Environment}'
+      AlarmDescription: 'Data pipeline experiencing errors'
+      MetricName: 'DataPipelineErrors'
+      Namespace: 'Bitcoin/Pipeline'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 3
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref CriticalAlertsTopic
+      TreatMissingData: notBreaching
+
+  # Prediction Accuracy Alarm
+  PredictionAccuracyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'Bitcoin-PredictionAccuracy-Low-${Environment}'
+      AlarmDescription: 'Model prediction accuracy has dropped'
+      MetricName: 'PredictionAccuracy'
+      Namespace: 'Bitcoin/ML'
+      Statistic: Average
+      Period: 3600
+      EvaluationPeriods: 2
+      Threshold: 70
+      ComparisonOperator: LessThanThreshold
+      AlarmActions:
+        - !Ref WarningAlertsTopic
+      TreatMissingData: notBreaching
+
+  # Comprehensive Dashboard
+  BitcoinSystemDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub 'Bitcoin-System-Overview-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Kinesis", "IncomingRecords", "StreamName", "bitcoin-price-stream-${Environment}" ],
+                  [ ".", "GetRecords.IteratorAgeMilliseconds", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Kinesis Data Streams",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/SageMaker", "Invocations", "EndpointName", "bitcoin-ensemble-endpoint-${Environment}" ],
+                  [ ".", "ModelLatency", ".", "." ],
+                  [ ".", "Invocation4XXErrors", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "SageMaker Endpoints",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ApiGateway", "Count" ],
+                  [ ".", "4XXError" ],
+                  [ ".", "5XXError" ],
+                  [ ".", "Latency" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "API Gateway",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "Bitcoin/ML", "PredictionAccuracy" ],
+                  [ "Bitcoin/Pipeline", "DataPipelineErrors" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Custom Metrics",
+                "period": 300
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 12,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/bitcoin-prediction-orchestrator' | fields @timestamp, @message\n| filter @message like /ERROR/\n| sort @timestamp desc\n| limit 20",
+                "region": "${AWS::Region}",
+                "title": "Recent Errors",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+  # Cost Monitoring Dashboard
+  CostMonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub 'Bitcoin-Cost-Monitoring-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/SageMaker", "Invocations", "EndpointName", "bitcoin-ensemble-endpoint-${Environment}" ],
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "bitcoin-prediction-orchestrator-${Environment}" ],
+                  [ "AWS/Kinesis", "IncomingRecords", "StreamName", "bitcoin-price-stream-${Environment}" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Usage Metrics (Cost Drivers)",
+                "period": 3600,
+                "stat": "Sum"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ES", "StorageUtilization", "DomainName", "bitcoin-analytics-${Environment}", "ClientId", "${AWS::AccountId}" ],
+                  [ "AWS/ElastiCache", "DatabaseMemoryUsagePercentage", "CacheClusterId", "bitcoin-redis-${Environment}" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Storage and Memory Usage",
+                "period": 3600
+              }
+            }
+          ]
+        }
+
+Outputs:
+  CriticalAlertsTopicArn:
+    Description: ARN of the critical alerts SNS topic
+    Value: !Ref CriticalAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-CriticalAlertsTopic'
+
+  WarningAlertsTopicArn:
+    Description: ARN of the warning alerts SNS topic
+    Value: !Ref WarningAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-WarningAlertsTopic'
+
+  InfoAlertsTopicArn:
+    Description: ARN of the info alerts SNS topic
+    Value: !Ref InfoAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-InfoAlertsTopic'
+
+  SystemDashboardUrl:
+    Description: URL of the system overview dashboard
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=Bitcoin-System-Overview-${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-SystemDashboard'
+
+  CostDashboardUrl:
+    Description: URL of the cost monitoring dashboard
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=Bitcoin-Cost-Monitoring-${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-CostDashboard'
+
+  NotificationEnhancerFunctionArn:
+    Description: ARN of the notification enhancer function
+    Value: !GetAtt NotificationEnhancerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationEnhancer'

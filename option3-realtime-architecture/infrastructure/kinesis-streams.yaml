@@ -1,0 +1,556 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Real-time Kinesis Data Streams Infrastructure for Bitcoin Predictions'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: 'production'
+    AllowedValues: ['development', 'staging', 'production']
+    Description: Deployment environment
+  
+  RetentionHours:
+    Type: Number
+    Default: 24
+    MinValue: 24
+    MaxValue: 168
+    Description: Data retention period in hours
+
+Resources:
+  # Bitcoin Price Data Stream - High throughput price feeds
+  BitcoinPriceStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub 'bitcoin-price-stream-${Environment}'
+      ShardCount: 10  # High throughput for price data
+      RetentionPeriodHours: !Ref RetentionHours
+      ShardLevelMetrics:
+        - IncomingRecords
+        - OutgoingRecords
+        - IncomingBytes
+        - OutgoingBytes
+        - WriteProvisionedThroughputExceeded
+        - ReadProvisionedThroughputExceeded
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: !Ref StreamEncryptionKey
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: DataStreaming
+        - Key: DataType
+          Value: PriceData
+
+  # Bitcoin News and Sentiment Stream
+  BitcoinNewsStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub 'bitcoin-news-stream-${Environment}'
+      ShardCount: 5  # Moderate throughput for news
+      RetentionPeriodHours: !Ref RetentionHours
+      ShardLevelMetrics:
+        - IncomingRecords
+        - OutgoingRecords
+        - IncomingBytes
+        - OutgoingBytes
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: !Ref StreamEncryptionKey
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: DataStreaming
+        - Key: DataType
+          Value: NewsData
+
+  # Social Media Sentiment Stream
+  BitcoinSocialStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub 'bitcoin-social-stream-${Environment}'
+      ShardCount: 3  # Lower throughput for social data
+      RetentionPeriodHours: !Ref RetentionHours
+      ShardLevelMetrics:
+        - IncomingRecords
+        - OutgoingRecords
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: !Ref StreamEncryptionKey
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: DataStreaming
+        - Key: DataType
+          Value: SocialData
+
+  # Market Data Stream (Order book, trades, volume)
+  BitcoinMarketStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub 'bitcoin-market-stream-${Environment}'
+      ShardCount: 8  # High throughput for market data
+      RetentionPeriodHours: !Ref RetentionHours
+      ShardLevelMetrics:
+        - IncomingRecords
+        - OutgoingRecords
+        - IncomingBytes
+        - OutgoingBytes
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: !Ref StreamEncryptionKey
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: DataStreaming
+        - Key: DataType
+          Value: MarketData
+
+  # KMS Key for Stream Encryption
+  StreamEncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: 'KMS Key for Kinesis Stream Encryption'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow Kinesis Service
+            Effect: Allow
+            Principal:
+              Service: kinesis.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: '*'
+          - Sid: Allow Lambda Functions
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  StreamEncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/bitcoin-streams-${Environment}'
+      TargetKeyId: !Ref StreamEncryptionKey
+
+  # Kinesis Analytics Application for Real-time Processing
+  RealTimeAnalytics:
+    Type: AWS::KinesisAnalytics::Application
+    Properties:
+      ApplicationName: !Sub 'bitcoin-realtime-analytics-${Environment}'
+      ApplicationDescription: 'Real-time Bitcoin price and sentiment analytics'
+      ApplicationCode: |
+        CREATE OR REPLACE STREAM "DESTINATION_SQL_STREAM" (
+          timestamp_col TIMESTAMP,
+          price DOUBLE,
+          volume DOUBLE,
+          sentiment_score DOUBLE,
+          news_count INTEGER,
+          price_change_1m DOUBLE,
+          price_change_5m DOUBLE,
+          price_change_15m DOUBLE,
+          volatility DOUBLE,
+          signal_strength DOUBLE
+        );
+
+        CREATE OR REPLACE PUMP "STREAM_PUMP" AS INSERT INTO "DESTINATION_SQL_STREAM"
+        SELECT STREAM 
+          ROWTIME_TO_TIMESTAMP(ROWTIME) as timestamp_col,
+          AVG(price) as price,
+          SUM(volume) as volume,
+          AVG(sentiment_score) as sentiment_score,
+          COUNT(*) as news_count,
+          (AVG(price) - LAG(AVG(price), 1) OVER (RANGE INTERVAL '1' MINUTE PRECEDING)) / LAG(AVG(price), 1) OVER (RANGE INTERVAL '1' MINUTE PRECEDING) * 100 as price_change_1m,
+          (AVG(price) - LAG(AVG(price), 5) OVER (RANGE INTERVAL '5' MINUTE PRECEDING)) / LAG(AVG(price), 5) OVER (RANGE INTERVAL '5' MINUTE PRECEDING) * 100 as price_change_5m,
+          (AVG(price) - LAG(AVG(price), 15) OVER (RANGE INTERVAL '15' MINUTE PRECEDING)) / LAG(AVG(price), 15) OVER (RANGE INTERVAL '15' MINUTE PRECEDING) * 100 as price_change_15m,
+          STDDEV_SAMP(price) as volatility,
+          CASE 
+            WHEN AVG(sentiment_score) > 0.3 AND (AVG(price) - LAG(AVG(price), 1) OVER (RANGE INTERVAL '1' MINUTE PRECEDING)) > 0 THEN 1.0
+            WHEN AVG(sentiment_score) < -0.3 AND (AVG(price) - LAG(AVG(price), 1) OVER (RANGE INTERVAL '1' MINUTE PRECEDING)) < 0 THEN -1.0
+            ELSE 0.0
+          END as signal_strength
+        FROM "SOURCE_SQL_STREAM_001"
+        WHERE price IS NOT NULL
+        GROUP BY 
+          ROWTIME_TO_TIMESTAMP(ROWTIME),
+          RANGE INTERVAL '1' MINUTE;
+      Inputs:
+        - NamePrefix: "SOURCE_SQL_STREAM"
+          InputSchema:
+            RecordColumns:
+              - Name: "timestamp"
+                SqlType: "TIMESTAMP"
+                Mapping: "$.timestamp"
+              - Name: "price"
+                SqlType: "DOUBLE"
+                Mapping: "$.price"
+              - Name: "volume"
+                SqlType: "DOUBLE"
+                Mapping: "$.volume"
+              - Name: "sentiment_score"
+                SqlType: "DOUBLE"
+                Mapping: "$.sentiment_score"
+              - Name: "source"
+                SqlType: "VARCHAR(50)"
+                Mapping: "$.source"
+            RecordFormat:
+              RecordFormatType: "JSON"
+              MappingParameters:
+                JSONMappingParameters:
+                  RecordRowPath: "$"
+          KinesisStreamsInput:
+            ResourceARN: !GetAtt BitcoinPriceStream.Arn
+            RoleARN: !GetAtt AnalyticsRole.Arn
+
+  # Kinesis Firehose for S3 Backup and Data Lake
+  PriceDataFirehose:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: !Sub 'bitcoin-price-firehose-${Environment}'
+      DeliveryStreamType: KinesisStreamAsSource
+      KinesisStreamSourceConfiguration:
+        KinesisStreamARN: !GetAtt BitcoinPriceStream.Arn
+        RoleARN: !GetAtt FirehoseRole.Arn
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !GetAtt DataLakeBucket.Arn
+        Prefix: 'price-data/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/'
+        ErrorOutputPrefix: 'errors/price-data/'
+        BufferingHints:
+          SizeInMBs: 5
+          IntervalInSeconds: 60
+        CompressionFormat: GZIP
+        DataFormatConversionConfiguration:
+          Enabled: true
+          OutputFormatConfiguration:
+            Serializer:
+              ParquetSerDe: {}
+        DynamicPartitioning:
+          Enabled: true
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+            - Type: Lambda
+              Parameters:
+                - ParameterName: LambdaArn
+                  ParameterValue: !GetAtt DataTransformFunction.Arn
+        RoleARN: !GetAtt FirehoseRole.Arn
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Sub '/aws/kinesisfirehose/bitcoin-price-firehose-${Environment}'
+
+  NewsDataFirehose:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: !Sub 'bitcoin-news-firehose-${Environment}'
+      DeliveryStreamType: KinesisStreamAsSource
+      KinesisStreamSourceConfiguration:
+        KinesisStreamARN: !GetAtt BitcoinNewsStream.Arn
+        RoleARN: !GetAtt FirehoseRole.Arn
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !GetAtt DataLakeBucket.Arn
+        Prefix: 'news-data/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/'
+        ErrorOutputPrefix: 'errors/news-data/'
+        BufferingHints:
+          SizeInMBs: 5
+          IntervalInSeconds: 300
+        CompressionFormat: GZIP
+        RoleARN: !GetAtt FirehoseRole.Arn
+
+  # S3 Bucket for Data Lake
+  DataLakeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'bitcoin-realtime-datalake-${Environment}-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+              - TransitionInDays: 365
+                StorageClass: DEEP_ARCHIVE
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt DataCatalogFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: 'price-data/'
+
+  # Lambda Function for Data Transformation
+  DataTransformFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'bitcoin-data-transform-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      MemorySize: 256
+      Timeout: 60
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import base64
+          import boto3
+          from datetime import datetime
+
+          def lambda_handler(event, context):
+              output = []
+              
+              for record in event['records']:
+                  # Decode the data
+                  payload = base64.b64decode(record['data'])
+                  data = json.loads(payload)
+                  
+                  # Add processing timestamp
+                  data['processed_at'] = datetime.utcnow().isoformat()
+                  
+                  # Add partitioning fields
+                  timestamp = datetime.fromisoformat(data.get('timestamp', datetime.utcnow().isoformat()))
+                  data['partition_year'] = timestamp.year
+                  data['partition_month'] = timestamp.month
+                  data['partition_day'] = timestamp.day
+                  data['partition_hour'] = timestamp.hour
+                  
+                  # Re-encode the data
+                  output_record = {
+                      'recordId': record['recordId'],
+                      'result': 'Ok',
+                      'data': base64.b64encode(
+                          (json.dumps(data) + '\n').encode('utf-8')
+                      ).decode('utf-8')
+                  }
+                  output.append(output_record)
+              
+              return {'records': output}
+
+  # Lambda Function for Data Catalog Updates
+  DataCatalogFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'bitcoin-data-catalog-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Timeout: 60
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          
+          glue = boto3.client('glue')
+          
+          def lambda_handler(event, context):
+              for record in event['Records']:
+                  bucket = record['s3']['bucket']['name']
+                  key = record['s3']['object']['key']
+                  
+                  # Update Glue Data Catalog
+                  try:
+                      glue.start_crawler(Name='bitcoin-data-crawler')
+                  except Exception as e:
+                      print(f"Error starting crawler: {str(e)}")
+              
+              return {'statusCode': 200}
+
+  # IAM Roles and Policies
+  AnalyticsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'BitcoinAnalyticsRole-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: kinesisanalytics.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: KinesisAnalyticsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:GetShardIterator
+                  - kinesis:GetRecords
+                  - kinesis:ListShards
+                Resource:
+                  - !GetAtt BitcoinPriceStream.Arn
+                  - !GetAtt BitcoinNewsStream.Arn
+
+  FirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'BitcoinFirehoseRole-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FirehoseDeliveryPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource:
+                  - !GetAtt DataLakeBucket.Arn
+                  - !Sub '${DataLakeBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:GetShardIterator
+                  - kinesis:GetRecords
+                  - kinesis:ListShards
+                Resource:
+                  - !GetAtt BitcoinPriceStream.Arn
+                  - !GetAtt BitcoinNewsStream.Arn
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt DataTransformFunction.Arn
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'BitcoinLambdaExecutionRole-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub '${DataLakeBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - glue:StartCrawler
+                  - glue:GetCrawler
+                Resource: '*'
+
+  # CloudWatch Alarms for Monitoring
+  PriceStreamIncomingRecordsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'BitcoinPriceStream-LowThroughput-${Environment}'
+      AlarmDescription: 'Price stream receiving insufficient data'
+      MetricName: IncomingRecords
+      Namespace: AWS/Kinesis
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 100
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: StreamName
+          Value: !Ref BitcoinPriceStream
+      TreatMissingData: breaching
+
+  StreamWriteProvisionedThroughputExceededAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'BitcoinStreams-WriteThrottling-${Environment}'
+      AlarmDescription: 'Kinesis streams experiencing write throttling'
+      MetricName: WriteProvisionedThroughputExceeded
+      Namespace: AWS/Kinesis
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: StreamName
+          Value: !Ref BitcoinPriceStream
+
+Outputs:
+  PriceStreamArn:
+    Description: ARN of the Bitcoin price stream
+    Value: !GetAtt BitcoinPriceStream.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-PriceStreamArn'
+
+  NewsStreamArn:
+    Description: ARN of the Bitcoin news stream
+    Value: !GetAtt BitcoinNewsStream.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-NewsStreamArn'
+
+  SocialStreamArn:
+    Description: ARN of the Bitcoin social stream
+    Value: !GetAtt BitcoinSocialStream.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SocialStreamArn'
+
+  MarketStreamArn:
+    Description: ARN of the Bitcoin market stream
+    Value: !GetAtt BitcoinMarketStream.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-MarketStreamArn'
+
+  DataLakeBucketName:
+    Description: Name of the data lake S3 bucket
+    Value: !Ref DataLakeBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-DataLakeBucket'
+
+  AnalyticsApplicationName:
+    Description: Name of the Kinesis Analytics application
+    Value: !Ref RealTimeAnalytics
+    Export:
+      Name: !Sub '${AWS::StackName}-AnalyticsApp'
+
+  StreamEncryptionKeyId:
+    Description: KMS Key ID for stream encryption
+    Value: !Ref StreamEncryptionKey
+    Export:
+      Name: !Sub '${AWS::StackName}-EncryptionKey'
