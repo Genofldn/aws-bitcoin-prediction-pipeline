@@ -1,0 +1,31 @@
+# ── FinBERT sentiment container (PyTorch CPU + HuggingFace transformers) ──────
+FROM python:3.10-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Base packages
+RUN pip install --no-cache-dir \
+    flask==3.0.3 \
+    gunicorn==21.2.0 \
+    numpy==1.26.4 \
+    boto3==1.34.0
+
+# CPU-only PyTorch (avoids CUDA overhead, ~250MB vs ~800MB)
+RUN pip install --no-cache-dir \
+    torch==2.2.2+cpu \
+    --extra-index-url https://download.pytorch.org/whl/cpu
+
+# HuggingFace transformers
+RUN pip install --no-cache-dir \
+    transformers==4.40.0
+
+WORKDIR /opt/program
+COPY serve.py /opt/program/serve.py
+
+EXPOSE 8080
+ENV PYTHONUNBUFFERED=1
+
+# Longer timeout: FinBERT cold-start loads 400MB weights
+ENTRYPOINT ["gunicorn", "--bind", "0.0.0.0:8080", "--timeout", "300", "--workers", "1", "serve:app"]

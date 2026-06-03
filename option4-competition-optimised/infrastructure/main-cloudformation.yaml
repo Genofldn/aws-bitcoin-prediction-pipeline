@@ -1,0 +1,2359 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Option 4 — Competition-Optimised Bitcoin Prediction Pipeline.
+  Retains all four Option 3 ML models (Ensemble XGBoost/RF, LSTM/GRU Deep Learning,
+  BERT Sentiment, ARIMA/Prophet Time Series) but replaces always-on provisioned
+  SageMaker endpoints with Serverless Inference (pay-per-invocation).
+  Kinesis, ElastiCache, OpenSearch, API Gateway, NAT Gateway, and VPC
+  are removed entirely. Two daily EventBridge schedules replace the streaming
+  ingest layer. A 23:30 BST SNS alert reminds you to submit before midnight.
+  Estimated cost: £10–18/month.
+
+# ─────────────────────────────────────────────
+# PARAMETERS
+# ─────────────────────────────────────────────
+Parameters:
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues: [development, staging, production]
+    Description: Deployment environment
+
+  DataBucketName:
+    Type: String
+    Description: >
+      Full name of the EXISTING S3 bucket for model artifacts, raw data, and predictions.
+      The bucket must already exist — CloudFormation will not create it.
+    Default: your-bucket-name
+
+  NotificationEmail:
+    Type: String
+    Description: Email address for the 23:30 submission reminder and error alerts
+    Default: your-email@example.com
+
+  NewsApiKey:
+    Type: String
+    NoEcho: true
+    Default: 'PLACEHOLDER'
+    Description: >
+      NewsAPI.org API key (free at newsapi.org).
+      Leave as PLACEHOLDER to skip news collection (sentiment will use keyword fallback).
+
+  CryptoCompareApiKey:
+    Type: String
+    NoEcho: true
+    Default: 'PLACEHOLDER'
+    Description: >
+      CryptoCompare API key (free at cryptocompare.com).
+      Leave as PLACEHOLDER to skip CryptoCompare data (CoinGecko data is used instead).
+
+  LstmModelVersion:
+    Type: String
+    Default: 'v2'
+    Description: >
+      Version suffix for the SageMaker LSTM model and endpoint config resources.
+      Increment (v3, v4, …) whenever a new model artifact is uploaded to S3
+      to force SageMaker to download the updated weights on next cold start.
+
+# ─────────────────────────────────────────────
+# RESOURCES
+# ─────────────────────────────────────────────
+Resources:
+
+  # ── S3 Bucket ─────────────────────────────────────────────────────────────
+  # NOTE: The bucket already exists and is referenced via the DataBucketName
+  # parameter. We do NOT create it here to avoid "BucketAlreadyExists" errors.
+  # Create an S3 bucket before deploying — pass its name as DataBucketName parameter
+  # manually and contains the trained model artifacts.
+  #
+  # Dummy SSM parameter so other resources can reference the bucket name
+  # via !Ref DataBucketNameParam without a circular dependency.
+  DataBucketNameParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/bitcoin-prediction/${Environment}/data-bucket-name'
+      Type: String
+      Value: !Ref DataBucketName
+      Description: S3 bucket name used by the Bitcoin prediction pipeline
+
+  # ── DynamoDB — Predictions Store ──────────────────────────────────────────
+  # Stores morning + evening predictions per day plus the weighted final value.
+  # Composite key: date (partition) + run_type (sort) so both runs coexist.
+  PredictionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'bitcoin-predictions-${Environment}'
+      BillingMode: PAY_PER_REQUEST       # On-demand — zero idle cost
+      TableClass: STANDARD
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - AttributeName: date
+          AttributeType: S
+        - AttributeName: run_type
+          AttributeType: S
+      KeySchema:
+        - AttributeName: date
+          KeyType: HASH
+        - AttributeName: run_type
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true                    # Auto-expire records after 90 days
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── SNS Topic — Submission Reminder + Error Alerts ────────────────────────
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'bitcoin-competition-alerts-${Environment}'
+      DisplayName: Bitcoin Competition Alerts
+
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref AlertTopic
+      Endpoint: !Ref NotificationEmail
+
+  # ── SSM Parameter Store — API Keys ────────────────────────────────────────
+  # Secrets stored securely; Lambda reads them at runtime via SDK.
+  NewsApiKeyParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/bitcoin-prediction/${Environment}/news-api-key'
+      Type: String
+      Value: !Ref NewsApiKey
+      Description: NewsAPI.org API key
+
+  CryptoCompareApiKeyParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/bitcoin-prediction/${Environment}/cryptocompare-api-key'
+      Type: String
+      Value: !Ref CryptoCompareApiKey
+      Description: CryptoCompare API key
+
+  # ── IAM Role — Lambda Execution ───────────────────────────────────────────
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'BitcoinOption4LambdaRole-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: Option4LambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: S3Access
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${DataBucketName}'
+                  - !Sub 'arn:aws:s3:::${DataBucketName}/*'
+              - Sid: DynamoDBAccess
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource: !GetAtt PredictionsTable.Arn
+              - Sid: SageMakerInvoke
+                Effect: Allow
+                Action:
+                  - sagemaker:InvokeEndpoint
+                Resource:
+                  - !Sub 'arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/bitcoin-ensemble-serverless-${Environment}'
+                  - !Sub 'arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/bitcoin-deeplearning-serverless-${Environment}'
+                  - !Sub 'arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/bitcoin-sentiment-serverless-${Environment}'
+                  - !Sub 'arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/bitcoin-timeseries-serverless-${Environment}'
+              - Sid: SNSPublish
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref AlertTopic
+              - Sid: SSMAccess
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:PutParameter
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/bitcoin-prediction/${Environment}/*'
+              - Sid: CloudWatchMetrics
+                Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+              - Sid: SageMakerManage
+                Effect: Allow
+                Action:
+                  - sagemaker:CreateModel
+                  - sagemaker:CreateEndpointConfig
+                  - sagemaker:UpdateEndpoint
+                  - sagemaker:DescribeEndpoint
+                  - sagemaker:CreateTrainingJob
+                  - sagemaker:DescribeTrainingJob
+                  - sagemaker:StopTrainingJob
+                  - sagemaker:ListTrainingJobs
+                Resource: '*'
+              - Sid: IAMPassRole
+                Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/BitcoinOption4SageMakerRole-${Environment}'
+
+  # ── IAM Role — SageMaker Execution ────────────────────────────────────────
+  SageMakerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'BitcoinOption4SageMakerRole-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+      Policies:
+        - PolicyName: SageMakerS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${DataBucketName}'
+                  - !Sub 'arn:aws:s3:::${DataBucketName}/*'
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # SAGEMAKER — SERVERLESS INFERENCE
+  # All four Option 3 models retained. Provisioned instances replaced with
+  # ServerlessConfig. No VpcConfig — removes NAT Gateway dependency entirely.
+  # Cold-start: ~5–10 seconds. Acceptable for a once/twice-daily batch run.
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  # ── Model 1: Ensemble (XGBoost + Random Forest + Gradient Boosting) ───────
+  EnsembleModel:
+    Type: AWS::SageMaker::Model
+    Properties:
+      ModelName: !Sub 'bitcoin-ensemble-model-${Environment}'
+      ExecutionRoleArn: !GetAtt SageMakerExecutionRole.Arn
+      PrimaryContainer:
+        Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/bitcoin-ensemble:latest'
+        ModelDataUrl: !Sub 's3://${DataBucketName}/models/ensemble/model.tar.gz'
+        Environment:
+          SAGEMAKER_PROGRAM: inference.py
+          SAGEMAKER_SUBMIT_DIRECTORY: /opt/ml/code
+          MODEL_TYPE: ensemble
+          SAGEMAKER_REGION: !Ref AWS::Region
+      # No VpcConfig — serverless endpoints run in AWS-managed infrastructure
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Option
+          Value: Option4
+
+  EnsembleEndpointConfig:
+    Type: AWS::SageMaker::EndpointConfig
+    Properties:
+      EndpointConfigName: !Sub 'bitcoin-ensemble-serverless-config-${Environment}'
+      ProductionVariants:
+        - VariantName: primary
+          ModelName: !GetAtt EnsembleModel.ModelName
+          ServerlessConfig:
+            MemorySizeInMB: 2048    # XGBoost/RF ensemble — reduced to fit account quota
+            MaxConcurrency: 2       # Two concurrent invocations max (morning + evening overlap unlikely)
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  EnsembleEndpoint:
+    Type: AWS::SageMaker::Endpoint
+    Properties:
+      EndpointName: !Sub 'bitcoin-ensemble-serverless-${Environment}'
+      EndpointConfigName: !GetAtt EnsembleEndpointConfig.EndpointConfigName
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Option
+          Value: Option4
+
+  # ── Model 2: Deep Learning (LSTM / GRU temporal pattern detection) ────────
+  DeepLearningModel:
+    Type: AWS::SageMaker::Model
+    Properties:
+      ModelName: !Sub 'bitcoin-deeplearning-model-${Environment}-${LstmModelVersion}'
+      ExecutionRoleArn: !GetAtt SageMakerExecutionRole.Arn
+      PrimaryContainer:
+        Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/bitcoin-lstm:latest'
+        ModelDataUrl: !Sub 's3://${DataBucketName}/models/deeplearning/model.tar.gz'
+        Environment:
+          SAGEMAKER_PROGRAM: inference.py
+          SAGEMAKER_SUBMIT_DIRECTORY: /opt/ml/code
+          MODEL_TYPE: deeplearning
+          SAGEMAKER_REGION: !Ref AWS::Region
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Option
+          Value: Option4
+        - Key: ModelVersion
+          Value: !Ref LstmModelVersion
+
+  DeepLearningEndpointConfig:
+    Type: AWS::SageMaker::EndpointConfig
+    Properties:
+      EndpointConfigName: !Sub 'bitcoin-deeplearning-serverless-config-${Environment}-${LstmModelVersion}'
+      ProductionVariants:
+        - VariantName: primary
+          ModelName: !GetAtt DeepLearningModel.ModelName
+          ServerlessConfig:
+            MemorySizeInMB: 3072    # LSTM/GRU — max allowed by account quota (6144 requires quota increase)
+            MaxConcurrency: 2
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  DeepLearningEndpoint:
+    Type: AWS::SageMaker::Endpoint
+    Properties:
+      EndpointName: !Sub 'bitcoin-deeplearning-serverless-${Environment}'
+      EndpointConfigName: !GetAtt DeepLearningEndpointConfig.EndpointConfigName
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Option
+          Value: Option4
+
+  # ── Model 3: Sentiment Analysis (BERT-based — news + social signals) ──────
+  SentimentModel:
+    Type: AWS::SageMaker::Model
+    Properties:
+      ModelName: !Sub 'bitcoin-sentiment-model-${Environment}'
+      ExecutionRoleArn: !GetAtt SageMakerExecutionRole.Arn
+      PrimaryContainer:
+        Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/bitcoin-sentiment:latest'
+        ModelDataUrl: !Sub 's3://${DataBucketName}/models/sentiment/model.tar.gz'
+        Environment:
+          SAGEMAKER_PROGRAM: inference.py
+          SAGEMAKER_SUBMIT_DIRECTORY: /opt/ml/code
+          MODEL_TYPE: sentiment
+          SAGEMAKER_REGION: !Ref AWS::Region
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Option
+          Value: Option4
+
+  SentimentEndpointConfig:
+    Type: AWS::SageMaker::EndpointConfig
+    Properties:
+      EndpointConfigName: !Sub 'bitcoin-sentiment-serverless-config-${Environment}'
+      ProductionVariants:
+        - VariantName: primary
+          ModelName: !GetAtt SentimentModel.ModelName
+          ServerlessConfig:
+            MemorySizeInMB: 3072    # FinBERT 440MB weights — 3GB sufficient; max allowed by account quota
+            MaxConcurrency: 2
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  SentimentEndpoint:
+    Type: AWS::SageMaker::Endpoint
+    Properties:
+      EndpointName: !Sub 'bitcoin-sentiment-serverless-${Environment}'
+      EndpointConfigName: !GetAtt SentimentEndpointConfig.EndpointConfigName
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Option
+          Value: Option4
+
+  # ── Model 4: Time Series (ARIMA + Prophet statistical forecasting) ────────
+  TimeSeriesModel:
+    Type: AWS::SageMaker::Model
+    Properties:
+      ModelName: !Sub 'bitcoin-timeseries-model-${Environment}'
+      ExecutionRoleArn: !GetAtt SageMakerExecutionRole.Arn
+      PrimaryContainer:
+        Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/bitcoin-timeseries:latest'
+        ModelDataUrl: !Sub 's3://${DataBucketName}/models/timeseries/model.tar.gz'
+        Environment:
+          SAGEMAKER_PROGRAM: inference.py
+          SAGEMAKER_SUBMIT_DIRECTORY: /opt/ml/code
+          MODEL_TYPE: timeseries
+          SAGEMAKER_REGION: !Ref AWS::Region
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Option
+          Value: Option4
+
+  TimeSeriesEndpointConfig:
+    Type: AWS::SageMaker::EndpointConfig
+    Properties:
+      EndpointConfigName: !Sub 'bitcoin-timeseries-serverless-config-${Environment}'
+      ProductionVariants:
+        - VariantName: primary
+          ModelName: !GetAtt TimeSeriesModel.ModelName
+          ServerlessConfig:
+            MemorySizeInMB: 2048    # ARIMA/Prophet are lightweight statistical models
+            MaxConcurrency: 2
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  TimeSeriesEndpoint:
+    Type: AWS::SageMaker::Endpoint
+    Properties:
+      EndpointName: !Sub 'bitcoin-timeseries-serverless-${Environment}'
+      EndpointConfigName: !GetAtt TimeSeriesEndpointConfig.EndpointConfigName
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Option
+          Value: Option4
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # LAMBDA FUNCTIONS
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  # ── Lambda 1: Data Collector ───────────────────────────────────────────────
+  # Pulls price, volume, and news data from free-tier APIs.
+  # Runs twice daily (morning + evening). Stores raw JSON to S3.
+  DataCollectorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'bitcoin-data-collector-${Environment}'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      MemorySize: 512
+      Timeout: 120
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          DATA_BUCKET: !Ref DataBucketName
+          ENVIRONMENT: !Ref Environment
+          NEWS_API_KEY_PARAM: !Sub '/bitcoin-prediction/${Environment}/news-api-key'
+          CRYPTOCOMPARE_KEY_PARAM: !Sub '/bitcoin-prediction/${Environment}/cryptocompare-api-key'
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+          import urllib.request
+          from datetime import datetime, timezone, timedelta
+
+          s3 = boto3.client('s3')
+          ssm = boto3.client('ssm')
+
+          def get_param(name):
+              return ssm.get_parameter(Name=name, WithDecryption=True)['Parameter']['Value']
+
+          def fetch_json(url, headers=None):
+              req = urllib.request.Request(url, headers=headers or {})
+              with urllib.request.urlopen(req, timeout=15) as r:
+                  return json.loads(r.read())
+
+          def lambda_handler(event, context):
+              run_type = event.get('run_type', 'morning')
+              today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+
+              # ── Hourly prices (7 days = 168 data points, free tier) ──────
+              # CoinGecko returns hourly data automatically for days <= 90
+              hourly_data = fetch_json(
+                  'https://api.coingecko.com/api/v3/coins/bitcoin/market_chart'
+                  '?vs_currency=usd&days=7'
+              )
+
+              # ── Daily prices (60 days for longer-term trend/Prophet) ─────
+              daily_data = fetch_json(
+                  'https://api.coingecko.com/api/v3/coins/bitcoin/market_chart'
+                  '?vs_currency=usd&days=60&interval=daily'
+              )
+
+              # ── OHLCV: CoinGecko OHLC (last 30 days) ────────────────────
+              ohlc_data = fetch_json(
+                  'https://api.coingecko.com/api/v3/coins/bitcoin/ohlc'
+                  '?vs_currency=usd&days=30'
+              )
+
+              # ── News headlines: NewsAPI (free tier — 100 req/day) ────────
+              try:
+                  news_key = get_param(os.environ['NEWS_API_KEY_PARAM'])
+                  if news_key and news_key != 'PLACEHOLDER':
+                      news_data = fetch_json(
+                          f'https://newsapi.org/v2/everything'
+                          f'?q=bitcoin+cryptocurrency&language=en&sortBy=publishedAt'
+                          f'&pageSize=30&apiKey={news_key}'
+                      )
+                  else:
+                      print("  NewsAPI key not configured — skipping news collection")
+                      news_data = {'articles': []}
+              except Exception as e:
+                  print(f"  NewsAPI collection failed: {e} — continuing without news")
+                  news_data = {'articles': []}
+
+              # ── Market metrics: CryptoCompare ────────────────────────────
+              try:
+                  cc_key = get_param(os.environ['CRYPTOCOMPARE_KEY_PARAM'])
+                  if cc_key and cc_key != 'PLACEHOLDER':
+                      cc_data = fetch_json(
+                          'https://min-api.cryptocompare.com/data/v2/histoday'
+                          '?fsym=BTC&tsym=USD&limit=60',
+                          headers={'authorization': f'Apikey {cc_key}'}
+                      )
+                  else:
+                      print("  CryptoCompare key not configured — skipping")
+                      cc_data = {'Data': {'Data': []}}
+              except Exception as e:
+                  print(f"  CryptoCompare collection failed: {e} — continuing")
+                  cc_data = {'Data': {'Data': []}}
+
+              payload = {
+                  'run_type': run_type,
+                  'date': today,
+                  'collected_at': datetime.now(timezone.utc).isoformat(),
+                  # Hourly data (168 points) for ensemble feature engineering + LSTM
+                  'hourly_prices':  hourly_data.get('prices', []),
+                  'hourly_volumes': hourly_data.get('total_volumes', []),
+                  # Daily data (60 points) for Prophet/ARIMA
+                  'price_history':  daily_data.get('prices', []),
+                  'volume_history': daily_data.get('total_volumes', []),
+                  'ohlc': ohlc_data,
+                  'news_articles': news_data.get('articles', []),
+                  'cc_daily': cc_data.get('Data', {}).get('Data', []),
+              }
+
+              key = f'raw-data/{today}/{run_type}.json'
+              s3.put_object(
+                  Bucket=os.environ['DATA_BUCKET'],
+                  Key=key,
+                  Body=json.dumps(payload),
+                  ContentType='application/json'
+              )
+
+              n_hourly = len(payload['hourly_prices'])
+              n_daily  = len(payload['price_history'])
+              print(f"[{run_type.upper()}] Raw data saved → {key} "
+                    f"(hourly: {n_hourly}, daily: {n_daily})")
+              return {'statusCode': 200, 'run_type': run_type, 'date': today, 's3_key': key}
+
+  # ── Lambda 2: Feature Engineer ─────────────────────────────────────────────
+  # Reads raw S3 data, computes technical indicators (RSI, MACD, Bollinger Bands,
+  # rolling sentiment), and writes feature vectors back to S3 for model ingestion.
+  FeatureEngineerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'bitcoin-feature-engineer-${Environment}'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      MemorySize: 1024
+      Timeout: 180
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          DATA_BUCKET: !Ref DataBucketName
+          ENVIRONMENT: !Ref Environment
+          SENTIMENT_ENDPOINT: !Sub 'bitcoin-sentiment-serverless-${Environment}'
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import math
+          import boto3
+          from datetime import datetime, timezone, timedelta
+
+          s3          = boto3.client('s3')
+          sm_runtime  = boto3.client('sagemaker-runtime')
+
+          # ── Technical indicators ───────────────────────────────────────────
+
+          def compute_rsi(prices, period=14):
+              if len(prices) < period + 1:
+                  return 50.0
+              gains, losses = [], []
+              for i in range(1, len(prices)):
+                  diff = prices[i] - prices[i-1]
+                  gains.append(max(diff, 0))
+                  losses.append(max(-diff, 0))
+              avg_gain = sum(gains[-period:]) / period
+              avg_loss = sum(losses[-period:]) / period
+              if avg_loss == 0:
+                  return 100.0
+              return 100 - (100 / (1 + avg_gain / avg_loss))
+
+          def compute_macd(prices, fast=12, slow=26, signal=9):
+              def ema(data, n):
+                  k = 2 / (n + 1)
+                  result = [data[0]]
+                  for v in data[1:]:
+                      result.append(v * k + result[-1] * (1 - k))
+                  return result
+              if len(prices) < slow:
+                  return 0.0, 0.0
+              macd_line = [f - s for f, s in zip(ema(prices, fast), ema(prices, slow))]
+              return macd_line[-1], ema(macd_line, signal)[-1]
+
+          def compute_bollinger(prices, period=20):
+              if len(prices) < period:
+                  return prices[-1], prices[-1], prices[-1]
+              window = prices[-period:]
+              mean = sum(window) / period
+              std  = math.sqrt(sum((x - mean) ** 2 for x in window) / period)
+              return mean + 2 * std, mean, mean - 2 * std
+
+          # ── FinBERT sentiment (real NLP) ───────────────────────────────────
+
+          def keyword_sentiment(articles):
+              """Fallback: keyword scoring when FinBERT unavailable."""
+              positive = ['surge', 'rally', 'rise', 'gain', 'bull', 'high', 'record',
+                          'adoption', 'approve', 'etf', 'launch', 'partnership', 'buy']
+              negative = ['crash', 'drop', 'fall', 'bear', 'ban', 'hack', 'fraud',
+                          'sell', 'low', 'plunge', 'loss', 'warning', 'risk', 'slide']
+              score, count = 0, 0
+              for a in articles[:20]:
+                  title = (a.get('title') or '').lower()
+                  score += sum(1 for w in positive if w in title)
+                  score -= sum(1 for w in negative if w in title)
+                  count += 1
+              raw = score / max(count, 1)
+              return max(-1.0, min(1.0, raw / 3.0))  # normalise to [-1, 1]
+
+          def finbert_sentiment(headlines, current_price):
+              """Call live FinBERT SageMaker endpoint; returns score in [-1, 1]."""
+              payload = json.dumps({
+                  'headlines': headlines[:20],
+                  'current_price': current_price
+              }).encode()
+              resp = sm_runtime.invoke_endpoint(
+                  EndpointName=os.environ['SENTIMENT_ENDPOINT'],
+                  ContentType='application/json',
+                  Body=payload
+              )
+              result = json.loads(resp['Body'].read())
+              # FinBERT endpoint returns {"sentiment": float, "prediction": price, ...}
+              # Key priority: 'sentiment' → 'sentiment_score' → 0.0
+              # Never use 'prediction' — that's the price prediction, not the sentiment.
+              return float(result.get('sentiment',
+                           result.get('sentiment_score', 0.0)))
+
+          # ── Sentiment history (builds a 168-point time series) ─────────────
+
+          HISTORY_PREFIX = 'sentiment-history/'
+
+          def store_sentiment(bucket, date, run_type, score, news_count, source):
+              """Persist current-run sentiment to S3 for future history retrieval."""
+              record = {
+                  'score':      score,
+                  'news_count': news_count,
+                  'source':     source,
+                  'timestamp':  datetime.now(timezone.utc).isoformat(),
+                  'run_type':   run_type,
+              }
+              s3.put_object(
+                  Bucket=bucket,
+                  Key=f'{HISTORY_PREFIX}{date}/{run_type}.json',
+                  Body=json.dumps(record),
+                  ContentType='application/json'
+              )
+
+          def load_sentiment_history(bucket, n_hours=168):
+              """
+              Load up to n_hours of past sentiment scores from S3.
+              We run twice daily so look back ~90 days to find 168+ entries.
+              Returns a list of (iso_timestamp, score) sorted oldest-first.
+              """
+              history = []
+              today = datetime.now(timezone.utc).date()
+              for days_back in range(90):
+                  check_date = (today - timedelta(days=days_back)).isoformat()
+                  for slot in ['evening', 'morning']:
+                      key = f'{HISTORY_PREFIX}{check_date}/{slot}.json'
+                      try:
+                          obj = s3.get_object(Bucket=bucket, Key=key)
+                          rec = json.loads(obj['Body'].read())
+                          history.append((rec['timestamp'], rec['score']))
+                      except Exception:
+                          pass
+                  if len(history) >= n_hours:
+                      break
+              history.sort(key=lambda x: x[0])  # oldest first
+              return history[-n_hours:]           # keep last n_hours
+
+          def build_hourly_sentiment_series(history, n_hours=168, default=0.0):
+              """
+              Convert sparse (per-run) history into a dense hourly series.
+              Uses forward-fill: each hour takes the most recent available score.
+              Returns a list of n_hours floats, oldest first.
+              """
+              if not history:
+                  return [default] * n_hours
+
+              now   = datetime.now(timezone.utc)
+              times = [datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                       if ts.endswith('Z') else datetime.fromisoformat(ts)
+                       for ts, _ in history]
+              scores = [s for _, s in history]
+
+              series = []
+              for h in range(n_hours - 1, -1, -1):          # newest → oldest
+                  target_time = now - timedelta(hours=h)
+                  # Find the most recent score at or before target_time
+                  score = default
+                  for i, t in enumerate(times):
+                      if t <= target_time:
+                          score = scores[i]
+                  series.append(score)
+              return series  # oldest first
+
+          # ── Lambda handler ─────────────────────────────────────────────────
+
+          def lambda_handler(event, context):
+              run_type = event.get('run_type', 'morning')
+              date     = event.get('date', datetime.now(timezone.utc).strftime('%Y-%m-%d'))
+              bucket   = os.environ['DATA_BUCKET']
+
+              # Load raw data
+              raw = json.loads(
+                  s3.get_object(Bucket=bucket, Key=f'raw-data/{date}/{run_type}.json')
+                  ['Body'].read()
+              )
+
+              # ── Price / volume series ──────────────────────────────────────
+              hourly_prices  = [p[1] for p in raw.get('hourly_prices',  []) if isinstance(p, list)]
+              hourly_volumes = [v[1] for v in raw.get('hourly_volumes', []) if isinstance(v, list)]
+              daily_prices   = [p[1] for p in raw.get('price_history',  []) if isinstance(p, list)]
+              daily_volumes  = [v[1] for v in raw.get('volume_history', []) if isinstance(v, list)]
+
+              prices  = hourly_prices  if hourly_prices  else daily_prices
+              volumes = hourly_volumes if hourly_volumes else daily_volumes
+              if not prices:
+                  raise ValueError("No price data in raw payload")
+
+              # ── Input data quality validation ──────────────────────────────
+              def validate_prices(px, label):
+                  """Raise ValueError with a descriptive message if data looks bad."""
+                  if len(px) < 24:
+                      raise ValueError(f"{label}: only {len(px)} points (need ≥ 24)")
+                  last24 = px[-24:]
+                  # All-identical prices → stale API cache
+                  if len(set(round(p, 0) for p in last24)) == 1:
+                      raise ValueError(f"{label}: last 24 values identical (stale cache?)")
+                  # Any zero or negative price
+                  if any(p <= 0 for p in last24):
+                      raise ValueError(f"{label}: contains zero/negative price")
+                  # Single-candle move >50% → bad tick / flash crash data
+                  for i in range(1, len(px)):
+                      chg = abs(px[i] - px[i-1]) / max(px[i-1], 1)
+                      if chg > 0.50:
+                          raise ValueError(
+                              f"{label}: extreme move at index {i}: "
+                              f"${px[i-1]:,.0f}→${px[i]:,.0f} ({chg:.1%})")
+
+              validation_ok = True
+              try:
+                  validate_prices(prices, 'prices')
+              except ValueError as ve:
+                  validation_ok = False
+                  warn_msg = f"⚠️ INPUT DATA QUALITY ALERT ({run_type} {date})\n{ve}\nFalling back to last valid feature set."
+                  print(f"  DATA VALIDATION FAILED: {ve}")
+                  try:
+                      sns_client = boto3.client('sns', region_name=os.environ.get('AWS_REGION','eu-west-2'))
+                      sns_client.publish(
+                          TopicArn=os.environ.get('ALERT_TOPIC_ARN',''),
+                          Subject='⚠️ Bitcoin Pipeline — Bad Input Data',
+                          Message=warn_msg
+                      )
+                  except Exception:
+                      pass
+                  # Try to fall back to the previous run's stored features
+                  prev_run = 'evening' if run_type == 'morning' else 'morning'
+                  from datetime import date as dt_date, timedelta as td
+                  yesterday = (dt_date.today() - td(days=1)).isoformat()
+                  for fallback_key in [
+                      f'features/{date}/{prev_run}.json',
+                      f'features/{yesterday}/evening.json',
+                  ]:
+                      try:
+                          fb = json.loads(s3.get_object(Bucket=bucket, Key=fallback_key)['Body'].read())
+                          prices  = fb.get('hourly_prices') or fb.get('daily_prices') or prices
+                          volumes = fb.get('hourly_volumes') or fb.get('daily_volumes') or volumes
+                          print(f"  Using fallback features from {fallback_key}")
+                          break
+                      except Exception:
+                          continue
+
+              current_price = prices[-1]
+
+              # ── Technical indicators ───────────────────────────────────────
+              rsi                     = compute_rsi(prices)
+              macd_val, macd_sig      = compute_macd(prices)
+              bb_upper, bb_mid, bb_lower = compute_bollinger(prices)
+              price_7d_change = ((prices[-1] - prices[-8]) / prices[-8] * 100) if len(prices) >= 8 else 0
+
+              # ── Sentiment: FinBERT (real NLP) with keyword fallback ────────
+              articles  = raw.get('news_articles', [])
+              headlines = [a.get('title', '') for a in articles[:30] if a.get('title')]
+              news_count = len(articles)
+
+              sentiment_source = 'keyword_fallback'
+              try:
+                  if headlines:
+                      sent = finbert_sentiment(headlines, current_price)
+                      sentiment_source = 'finbert'
+                      print(f"  FinBERT sentiment: {sent:.3f} (from {len(headlines)} headlines)")
+                  else:
+                      sent = 0.0
+                      print("  No headlines — sentiment=0.0")
+              except Exception as e:
+                  print(f"  FinBERT call failed ({e}), using keyword fallback")
+                  sent = keyword_sentiment(articles)
+
+              # Store this run's score for future history retrieval
+              store_sentiment(bucket, date, run_type, sent, news_count, sentiment_source)
+
+              # Build 168-point hourly sentiment time series (for LSTM features)
+              history = load_sentiment_history(bucket, n_hours=168)
+              sentiment_history = build_hourly_sentiment_series(history, n_hours=168, default=sent)
+
+              # ── Write features ─────────────────────────────────────────────
+              features = {
+                  'run_type':        run_type,
+                  'date':            date,
+                  'engineered_at':   datetime.now(timezone.utc).isoformat(),
+                  'current_price':   current_price,
+                  # Raw series for model endpoints
+                  'hourly_prices':   hourly_prices[-200:] if hourly_prices else daily_prices,
+                  'hourly_volumes':  hourly_volumes[-200:] if hourly_volumes else daily_volumes,
+                  'daily_prices':    daily_prices,
+                  'daily_volumes':   daily_volumes,
+                  'headlines':       headlines,
+                  # Sentiment: current score + 168-point hourly history
+                  'sentiment_score':   sent,
+                  'sentiment_history': sentiment_history,   # ← new: full time series
+                  'sentiment_source':  sentiment_source,
+                  'news_count':        news_count,
+                  # Technical indicators (metadata)
+                  'rsi_14':          rsi,
+                  'macd':            macd_val,
+                  'macd_signal':     macd_sig,
+                  'macd_histogram':  macd_val - macd_sig,
+                  'bb_upper':        bb_upper,
+                  'bb_mid':          bb_mid,
+                  'bb_lower':        bb_lower,
+                  'price_7d_change_pct': price_7d_change,
+              }
+
+              key = f'features/{date}/{run_type}.json'
+              s3.put_object(Bucket=bucket, Key=key,
+                            Body=json.dumps(features), ContentType='application/json')
+
+              print(f"[{run_type.upper()}] Features → {key} | "
+                    f"price=${current_price:,.0f} | RSI={rsi:.1f} | "
+                    f"sentiment={sent:.3f} ({sentiment_source}) | "
+                    f"history_pts={len(history)}")
+              return {'statusCode': 200, 'run_type': run_type, 'date': date, 'features_key': key}
+
+  # ── Lambda 3: Ensemble Orchestrator ───────────────────────────────────────
+  # Invokes all 4 SageMaker serverless endpoints, aggregates outputs,
+  # applies 30/70 morning/evening weighting, writes final prediction to DynamoDB,
+  # and publishes an SNS alert showing the prediction for human review.
+  EnsembleOrchestratorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'bitcoin-ensemble-orchestrator-${Environment}'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      MemorySize: 512
+      Timeout: 300          # 5 minutes: cold-start + 4 serverless endpoint invocations
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          DATA_BUCKET: !Ref DataBucketName
+          PREDICTIONS_TABLE: !Ref PredictionsTable
+          ALERT_TOPIC_ARN: !Ref AlertTopic
+          ENVIRONMENT: !Ref Environment
+          ENSEMBLE_ENDPOINT: !Sub 'bitcoin-ensemble-serverless-${Environment}'
+          DEEPLEARNING_ENDPOINT: !Sub 'bitcoin-deeplearning-serverless-${Environment}'
+          SENTIMENT_ENDPOINT: !Sub 'bitcoin-sentiment-serverless-${Environment}'
+          TIMESERIES_ENDPOINT: !Sub 'bitcoin-timeseries-serverless-${Environment}'
+          # Weighting: evening has more data, carries more authority
+          MORNING_WEIGHT: '0.30'
+          EVENING_WEIGHT: '0.70'
+          # Within each run, equal weight across models (tune after 30 days of results)
+          ENSEMBLE_MODEL_WEIGHT: '0.30'
+          DEEPLEARNING_MODEL_WEIGHT: '0.25'
+          SENTIMENT_MODEL_WEIGHT: '0.20'
+          TIMESERIES_MODEL_WEIGHT: '0.25'
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+          from datetime import datetime, timezone, timedelta
+          from decimal import Decimal
+
+          s3 = boto3.client('s3')
+          sm_runtime = boto3.client('sagemaker-runtime')
+          dynamodb = boto3.resource('dynamodb')
+          sns = boto3.client('sns')
+          cw = boto3.client('cloudwatch')
+
+          def invoke_model(endpoint_name, features):
+              """Invoke a SageMaker serverless endpoint and return the prediction."""
+              try:
+                  response = sm_runtime.invoke_endpoint(
+                      EndpointName=endpoint_name,
+                      ContentType='application/json',
+                      Accept='application/json',
+                      Body=json.dumps(features)
+                  )
+                  result = json.loads(response['Body'].read())
+                  # Expect response: {"prediction": 95000.0} or {"price_24h": 95000.0}
+                  return float(result.get('prediction') or result.get('price_24h') or 0)
+              except Exception as e:
+                  print(f"WARNING: {endpoint_name} failed — {e}")
+                  return None  # Handled below by dropping failed models
+
+          def weighted_average(values, weights):
+              total_weight = sum(w for v, w in zip(values, weights) if v is not None)
+              if total_weight == 0:
+                  return None
+              return sum(v * w for v, w in zip(values, weights) if v is not None) / total_weight
+
+          def lambda_handler(event, context):
+              run_type = event.get('run_type', 'morning')
+              date = event.get('date', datetime.now(timezone.utc).strftime('%Y-%m-%d'))
+              bucket = os.environ['DATA_BUCKET']
+              table = dynamodb.Table(os.environ['PREDICTIONS_TABLE'])
+
+              # Load engineered features
+              features = json.loads(
+                  s3.get_object(Bucket=bucket, Key=f'features/{date}/{run_type}.json')
+                  ['Body'].read()
+              )
+
+              # ── Invoke all 4 serverless models ───────────────────────────
+              print(f"[{run_type.upper()}] Invoking 4 SageMaker serverless endpoints…")
+              ensemble_pred     = invoke_model(os.environ['ENSEMBLE_ENDPOINT'], features)
+              deeplearning_pred = invoke_model(os.environ['DEEPLEARNING_ENDPOINT'], features)
+              sentiment_pred    = invoke_model(os.environ['SENTIMENT_ENDPOINT'], features)
+              timeseries_pred   = invoke_model(os.environ['TIMESERIES_ENDPOINT'], features)
+
+              model_weights = [
+                  float(os.environ['ENSEMBLE_MODEL_WEIGHT']),
+                  float(os.environ['DEEPLEARNING_MODEL_WEIGHT']),
+                  float(os.environ['SENTIMENT_MODEL_WEIGHT']),
+                  float(os.environ['TIMESERIES_MODEL_WEIGHT']),
+              ]
+              model_predictions = [ensemble_pred, deeplearning_pred, sentiment_pred, timeseries_pred]
+
+              # Weighted average across models (drops any that failed)
+              run_prediction = weighted_average(model_predictions, model_weights)
+              if run_prediction is None:
+                  raise RuntimeError("All model endpoints failed — cannot produce prediction")
+
+              print(f"  Ensemble: ${ensemble_pred:,.0f}"     if ensemble_pred     else "  Ensemble: FAILED")
+              print(f"  DeepLearn: ${deeplearning_pred:,.0f}" if deeplearning_pred else "  DeepLearn: FAILED")
+              print(f"  Sentiment: ${sentiment_pred:,.0f}"   if sentiment_pred   else "  Sentiment: FAILED")
+              print(f"  TimeSeries: ${timeseries_pred:,.0f}" if timeseries_pred  else "  TimeSeries: FAILED")
+              print(f"  Run prediction ({run_type}): ${run_prediction:,.0f}")
+
+              # ── Final prediction sanity guard ─────────────────────────────
+              BTC_FLOOR, BTC_CEILING = 15_000, 600_000
+              if not (BTC_FLOOR <= run_prediction <= BTC_CEILING):
+                  alert_msg = (
+                      f"🚨 HALLUCINATION GUARD TRIGGERED ({run_type} {date})\n"
+                      f"Blended prediction ${run_prediction:,.0f} is outside safe range "
+                      f"[${BTC_FLOOR:,} – ${BTC_CEILING:,}].\n"
+                      f"Individual models: Ensemble={ensemble_pred}, DL={deeplearning_pred}, "
+                      f"Sentiment={sentiment_pred}, TS={timeseries_pred}\n"
+                      f"Pipeline aborted — no prediction stored."
+                  )
+                  print(f"  🚨 GUARD TRIGGERED: {run_prediction:,.0f} outside [{BTC_FLOOR:,}, {BTC_CEILING:,}]")
+                  sns_client.publish(TopicArn=os.environ['ALERT_TOPIC_ARN'],
+                                     Subject='🚨 Bitcoin Pipeline — Prediction Halted',
+                                     Message=alert_msg)
+                  raise RuntimeError(alert_msg)
+
+              # ── Cross-model spread check (informational warning) ───────────
+              live_preds = [p for p in model_predictions if p is not None]
+              if len(live_preds) >= 2:
+                  spread = max(live_preds) - min(live_preds)
+                  if spread > 25_000:
+                      print(f"  ⚠️ HIGH MODEL SPREAD: ${spread:,.0f} (models disagree significantly)")
+
+              # ── Morning run: store and done ───────────────────────────────
+              # Read current_price from features so accuracy tracker can use it tomorrow
+              try:
+                  feat_obj = s3.get_object(
+                      Bucket=os.environ['DATA_BUCKET'],
+                      Key=f'features/{date}/{run_type}.json')
+                  feat_data = json.loads(feat_obj['Body'].read())
+                  current_price_now = float(feat_data.get('current_price', 0))
+              except Exception:
+                  current_price_now = 0
+
+              if run_type == 'morning':
+                  ttl = int((datetime.now(timezone.utc) + timedelta(days=90)).timestamp())
+                  table.put_item(Item={
+                      'date': date,
+                      'run_type': 'morning',
+                      'prediction': Decimal(str(round(run_prediction, 2))),
+                      'current_price': Decimal(str(round(current_price_now, 2))),
+                      'model_predictions': {
+                          'ensemble': Decimal(str(round(ensemble_pred, 2))) if ensemble_pred else None,
+                          'deeplearning': Decimal(str(round(deeplearning_pred, 2))) if deeplearning_pred else None,
+                          'sentiment': Decimal(str(round(sentiment_pred, 2))) if sentiment_pred else None,
+                          'timeseries': Decimal(str(round(timeseries_pred, 2))) if timeseries_pred else None,
+                      },
+                      'timestamp': datetime.now(timezone.utc).isoformat(),
+                      'ttl': ttl,
+                  })
+                  final_prediction = run_prediction
+                  confidence_delta = None
+                  ens_s  = f"${ensemble_pred:,.0f}"     if ensemble_pred     else "FAILED"
+                  dl_s   = f"${deeplearning_pred:,.0f}"  if deeplearning_pred  else "FAILED"
+                  sent_s = f"${sentiment_pred:,.0f}"     if sentiment_pred     else "FAILED"
+                  ts_s   = f"${timeseries_pred:,.0f}"    if timeseries_pred    else "FAILED"
+                  message = (
+                      f"📊 MORNING PREDICTION ({date})\n\n"
+                      f"BTC predicted price: ${run_prediction:,.0f}\n\n"
+                      f"Model breakdown:\n"
+                      f"  • Ensemble (XGBoost/RF): {ens_s}\n"
+                      f"  • Deep Learning (LSTM):  {dl_s}\n"
+                      f"  • Sentiment (BERT):       {sent_s}\n"
+                      f"  • Time Series (ARIMA):   {ts_s}\n\n"
+                      f"Evening run at 21:00 BST will refine this.\n"
+                      f"Final prediction due by 23:55 BST."
+                  )
+
+              # ── Evening run: apply 30/70 morning/evening weighting ────────
+              else:
+                  morning_response = table.get_item(Key={'date': date, 'run_type': 'morning'})
+                  morning_record = morning_response.get('Item')
+
+                  if morning_record:
+                      morning_prediction = float(morning_record['prediction'])
+                      morning_weight = float(os.environ['MORNING_WEIGHT'])
+                      evening_weight = float(os.environ['EVENING_WEIGHT'])
+                      final_prediction = (morning_weight * morning_prediction) + (evening_weight * run_prediction)
+                      confidence_delta = abs(morning_prediction - run_prediction)
+                      high_divergence = confidence_delta > 500  # Alert if >$500 gap
+                      print(f"  Morning pred: ${morning_prediction:,.0f}")
+                      print(f"  Evening pred: ${run_prediction:,.0f}")
+                      print(f"  Weighted final (30/70): ${final_prediction:,.0f}")
+                      print(f"  Confidence delta: ${confidence_delta:,.0f}" + (" ⚠️ HIGH DIVERGENCE" if high_divergence else ""))
+                  else:
+                      # Morning run missing — use evening alone
+                      final_prediction = run_prediction
+                      confidence_delta = 0
+                      high_divergence = False
+                      morning_prediction = None
+                      print("  WARNING: No morning prediction found — using evening alone")
+
+                  ttl = int((datetime.now(timezone.utc) + timedelta(days=90)).timestamp())
+                  table.put_item(Item={
+                      'date': date,
+                      'run_type': 'evening',
+                      'prediction': Decimal(str(round(run_prediction, 2))),
+                      'final_prediction': Decimal(str(round(final_prediction, 2))),
+                      'current_price': Decimal(str(round(current_price_now, 2))),
+                      'confidence_delta': Decimal(str(round(confidence_delta or 0, 2))),
+                      'model_predictions': {
+                          'ensemble': Decimal(str(round(ensemble_pred, 2))) if ensemble_pred else None,
+                          'deeplearning': Decimal(str(round(deeplearning_pred, 2))) if deeplearning_pred else None,
+                          'sentiment': Decimal(str(round(sentiment_pred, 2))) if sentiment_pred else None,
+                          'timeseries': Decimal(str(round(timeseries_pred, 2))) if timeseries_pred else None,
+                      },
+                      'timestamp': datetime.now(timezone.utc).isoformat(),
+                      'ttl': ttl,
+                  })
+
+                  divergence_warning = f"\n⚠️ HIGH DIVERGENCE WARNING — ${confidence_delta:,.0f} gap between runs. Market may be volatile.\n" if high_divergence else ""
+                  morning_line = f"  • Morning run:          ${morning_prediction:,.0f}" if morning_prediction else "  • Morning run:          NOT AVAILABLE"
+                  ens_s  = f"${ensemble_pred:,.0f}"     if ensemble_pred     else "FAILED"
+                  dl_s   = f"${deeplearning_pred:,.0f}"  if deeplearning_pred  else "FAILED"
+                  sent_s = f"${sentiment_pred:,.0f}"     if sentiment_pred     else "FAILED"
+                  ts_s   = f"${timeseries_pred:,.0f}"    if timeseries_pred    else "FAILED"
+                  message = (
+                      f"🎯 FINAL PREDICTION ({date})\n"
+                      f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                      f"SUBMIT THIS TO RAINFACE: ${final_prediction:,.0f}\n"
+                      f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                      f"{divergence_warning}\n"
+                      f"How it was calculated:\n"
+                      f"{morning_line} (30% weight)\n"
+                      f"  • Evening run:          ${run_prediction:,.0f} (70% weight)\n\n"
+                      f"Evening model breakdown:\n"
+                      f"  • Ensemble (XGBoost/RF): {ens_s}\n"
+                      f"  • Deep Learning (LSTM):  {dl_s}\n"
+                      f"  • Sentiment (BERT):       {sent_s}\n"
+                      f"  • Time Series (ARIMA):   {ts_s}\n\n"
+                      f"⏰ Submit at rainface.finance before midnight BST."
+                  )
+
+              # Publish SNS notification
+              sns.publish(
+                  TopicArn=os.environ['ALERT_TOPIC_ARN'],
+                  Subject=f"Bitcoin Prediction {run_type.title()} Run — {date}",
+                  Message=message
+              )
+
+              # Publish accuracy metric to CloudWatch for tracking over time
+              cw.put_metric_data(
+                  Namespace='BitcoinPrediction/Option4',
+                  MetricData=[{
+                      'MetricName': 'PredictedPrice',
+                      'Value': final_prediction,
+                      'Unit': 'None',
+                      'Dimensions': [
+                          {'Name': 'RunType', 'Value': run_type},
+                          {'Name': 'Environment', 'Value': os.environ['ENVIRONMENT']},
+                      ]
+                  }]
+              )
+
+              return {
+                  'statusCode': 200,
+                  'run_type': run_type,
+                  'date': date,
+                  'final_prediction': round(final_prediction, 2),
+                  'confidence_delta': round(confidence_delta, 2) if confidence_delta else None,
+              }
+
+  # ── Lambda 4: Pipeline Coordinator ────────────────────────────────────────
+  # Triggered by EventBridge. Invokes Collector → FeatureEngineer → Orchestrator
+  # in sequence, passing run_type and date between steps.
+  PipelineCoordinatorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'bitcoin-pipeline-coordinator-${Environment}'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      MemorySize: 256
+      Timeout: 600          # 10 minutes total pipeline budget
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          COLLECTOR_FUNCTION: !Ref DataCollectorFunction
+          FEATURE_ENGINEER_FUNCTION: !Ref FeatureEngineerFunction
+          ORCHESTRATOR_FUNCTION: !Ref EnsembleOrchestratorFunction
+          ALERT_TOPIC_ARN: !Ref AlertTopic
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+          from datetime import datetime, timezone
+
+          lm = boto3.client('lambda')
+          sns = boto3.client('sns')
+
+          def invoke_sync(function_name, payload):
+              response = lm.invoke(
+                  FunctionName=function_name,
+                  InvocationType='RequestResponse',
+                  Payload=json.dumps(payload)
+              )
+              result = json.loads(response['Payload'].read())
+              if response.get('FunctionError'):
+                  raise RuntimeError(f"{function_name} failed: {result}")
+              return result
+
+          def lambda_handler(event, context):
+              run_type = event.get('run_type', 'morning')
+              date = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+
+              print(f"[COORDINATOR] Starting {run_type.upper()} pipeline for {date}")
+
+              try:
+                  # Step 1: Collect raw data
+                  collect_result = invoke_sync(
+                      os.environ['COLLECTOR_FUNCTION'],
+                      {'run_type': run_type, 'date': date}
+                  )
+                  print(f"[COORDINATOR] Collection complete → {collect_result.get('s3_key')}")
+
+                  # Step 2: Engineer features
+                  feature_result = invoke_sync(
+                      os.environ['FEATURE_ENGINEER_FUNCTION'],
+                      {'run_type': run_type, 'date': date}
+                  )
+                  print(f"[COORDINATOR] Features ready → {feature_result.get('features_key')}")
+
+                  # Step 3: Run ensemble and orchestrate final prediction
+                  prediction_result = invoke_sync(
+                      os.environ['ORCHESTRATOR_FUNCTION'],
+                      {'run_type': run_type, 'date': date}
+                  )
+                  print(f"[COORDINATOR] Pipeline complete. Prediction: ${prediction_result.get('final_prediction'):,.0f}")
+                  return prediction_result
+
+              except Exception as e:
+                  error_msg = f"❌ PIPELINE FAILURE ({run_type.upper()} run, {date})\n\nError: {str(e)}\n\nCheck CloudWatch logs for details."
+                  sns.publish(
+                      TopicArn=os.environ['ALERT_TOPIC_ARN'],
+                      Subject=f"Bitcoin Pipeline ERROR — {run_type} run {date}",
+                      Message=error_msg
+                  )
+                  raise
+
+  # Lambda permission: allow EventBridge to invoke coordinator
+  CoordinatorEventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PipelineCoordinatorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !Sub 'arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/*'
+
+  # Lambda permission: coordinator must invoke child functions
+  CoordinatorInvokeLambdaPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub 'CoordinatorInvokePolicy-${Environment}'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: lambda:InvokeFunction
+            Resource:
+              - !GetAtt DataCollectorFunction.Arn
+              - !GetAtt FeatureEngineerFunction.Arn
+              - !GetAtt EnsembleOrchestratorFunction.Arn
+      Roles:
+        - !Ref LambdaExecutionRole
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # EVENTBRIDGE SCHEDULES
+  # All times in UTC. UK uses BST (UTC+1) in summer.
+  # Morning:  07:00 UTC = 08:00 BST
+  # Evening:  20:00 UTC = 21:00 BST
+  # Reminder: 22:30 UTC = 23:30 BST  (30 mins before midnight deadline)
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  MorningPipelineRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'bitcoin-morning-pipeline-${Environment}'
+      Description: 'Triggers the morning prediction pipeline at 08:00 BST (07:00 UTC)'
+      ScheduleExpression: 'cron(0 7 * * ? *)'
+      State: ENABLED
+      Targets:
+        - Id: MorningCoordinator
+          Arn: !GetAtt PipelineCoordinatorFunction.Arn
+          Input: !Sub '{"run_type": "morning"}'
+
+  EveningPipelineRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'bitcoin-evening-pipeline-${Environment}'
+      Description: 'Triggers the evening prediction pipeline at 21:00 BST (20:00 UTC)'
+      ScheduleExpression: 'cron(0 20 * * ? *)'
+      State: ENABLED
+      Targets:
+        - Id: EveningCoordinator
+          Arn: !GetAtt PipelineCoordinatorFunction.Arn
+          Input: !Sub '{"run_type": "evening"}'
+
+  # 23:30 BST reminder — SNS fires directly (no Lambda needed).
+  # Reminds you to go to rainface.finance and submit tonight's prediction.
+  SubmissionReminderRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'bitcoin-submission-reminder-${Environment}'
+      Description: '23:30 BST submission reminder — 30 mins before midnight Rainface deadline'
+      ScheduleExpression: 'cron(30 22 * * ? *)'
+      State: ENABLED
+      Targets:
+        - Id: SubmissionSNS
+          Arn: !Ref AlertTopic
+          Input: !Sub |
+            {
+              "default": "⏰ SUBMIT NOW — 30 minutes to midnight.\nGo to rainface.finance, check your evening prediction in DynamoDB table bitcoin-predictions-${Environment}, and submit the final_prediction value before midnight BST.",
+              "email": "⏰ SUBMIT NOW — 30 minutes to midnight.\n\nGo to rainface.finance and submit your Bitcoin prediction before midnight BST.\n\nCheck DynamoDB table: bitcoin-predictions-${Environment}\nLook for today's date, run_type = evening, field = final_prediction.\n\nGood luck! 🎯"
+            }
+
+  SubmissionReminderSNSPermission:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref AlertTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowEventBridgePublish
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref AlertTopic
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # WEEKLY RETRAINING — refreshes training data + all models every Sunday 02:00 UTC
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  WeeklyRetrainingFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'bitcoin-weekly-retrain-${Environment}'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      MemorySize: 3008       # 3 GB — max default quota; sufficient for sklearn/xgboost on 17k rows
+      Timeout: 900           # 15 minutes — covers data fetch + ensemble training
+      Role: !GetAtt LambdaExecutionRole.Arn
+      EphemeralStorage:
+        Size: 2048           # 2 GB /tmp for pip packages + parquet (default max without quota increase)
+      Environment:
+        Variables:
+          DATA_BUCKET: !Ref DataBucketName
+          ENVIRONMENT: !Ref Environment
+          SAGEMAKER_ROLE_ARN: !GetAtt SageMakerExecutionRole.Arn
+          LSTM_ECR_IMAGE: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/bitcoin-lstm:latest'
+          LSTM_MODEL_VERSION_PARAM: !Sub '/bitcoin-prediction/${Environment}/lstm-model-version'
+          ENSEMBLE_ECR_IMAGE: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/bitcoin-ensemble:latest'
+      Code:
+        ZipFile: |
+          """
+          Weekly retraining Lambda.
+          1. Fetches latest 7-day hourly prices from CoinGecko and appends to the
+             training parquet already on S3 (keeps 2 years of data rolling).
+          2. Retrains Ensemble (XGBoost + RF + GradientBoosting) in-process.
+          3. Retrains TimeSeries (ARIMA + Prophet stubs) in-process.
+          4. Uploads new model artifacts to S3 and updates SageMaker endpoints.
+          5. Submits a SageMaker Training Job for LSTM (GPU, async — completes in ~4h).
+          """
+          import json, os, sys, subprocess, io, time
+          from datetime import datetime, timezone
+
+          import boto3
+          import urllib.request
+
+          s3  = boto3.client('s3')
+          ssm = boto3.client('ssm')
+          sm  = boto3.client('sagemaker')
+
+          BUCKET = os.environ['DATA_BUCKET']
+          REGION = os.environ.get('AWS_REGION', 'eu-west-2')
+
+          # ── pip install heavy deps into /tmp ────────────────────────────────
+
+          def pip_install(*packages):
+              target = '/tmp/pypackages'
+              subprocess.check_call(
+                  [sys.executable, '-m', 'pip', 'install', '--quiet',
+                   '--target', target, '--upgrade'] + list(packages),
+                  stdout=subprocess.DEVNULL
+              )
+              if target not in sys.path:
+                  sys.path.insert(0, target)
+
+          # ── Data refresh: append latest 7-day hourly data to parquet ────────
+
+          def refresh_training_data():
+              print("Fetching latest 7-day hourly prices from CoinGecko...")
+              pip_install('pandas==2.2.2', 'pyarrow==15.0.2')
+              import pandas as pd
+
+              url = ('https://api.coingecko.com/api/v3/coins/bitcoin/market_chart'
+                     '?vs_currency=usd&days=7')
+              with urllib.request.urlopen(url, timeout=20) as r:
+                  cg = json.loads(r.read())
+              prices  = cg.get('prices', [])
+              volumes = cg.get('total_volumes', [])
+              if not prices:
+                  print("  No price data from CoinGecko — skipping refresh")
+                  return
+
+              # Load existing parquet
+              parquet_key = 'training-data/btc_hourly.parquet'
+              try:
+                  obj = s3.get_object(Bucket=BUCKET, Key=parquet_key)
+                  existing = pd.read_parquet(io.BytesIO(obj['Body'].read()))
+              except Exception:
+                  existing = pd.DataFrame()
+
+              # Build new rows from CoinGecko response
+              new_rows = []
+              vol_map = {int(v[0]): v[1] for v in volumes}
+              for ts_ms, price in prices:
+                  new_rows.append({
+                      'timestamp': pd.Timestamp(ts_ms, unit='ms', tz='UTC'),
+                      'price':     price,
+                      'open':      price,   # approximated
+                      'high':      price,
+                      'low':       price,
+                      'volume':    vol_map.get(int(ts_ms), 1e8),
+                      'trades':    10000,
+                      'returns_1h':    0.0,   # recomputed below
+                      'returns_24h':   0.0,
+                      'sentiment_score': 0.0,
+                      'news_count': 10,
+                  })
+              new_df = pd.DataFrame(new_rows)
+              new_df['returns_1h']  = new_df['price'].pct_change().fillna(0)
+              new_df['returns_24h'] = new_df['price'].pct_change(24).fillna(0)
+
+              # Merge: keep existing + new, deduplicate by timestamp, keep latest 2 years
+              if not existing.empty:
+                  combined = pd.concat([existing, new_df]).drop_duplicates(
+                      subset='timestamp', keep='last').sort_values('timestamp')
+              else:
+                  combined = new_df.sort_values('timestamp')
+
+              # Rolling 2-year window (17,520 hourly points)
+              combined = combined.tail(17520).reset_index(drop=True)
+
+              buf = io.BytesIO()
+              combined.to_parquet(buf, index=False)
+              s3.put_object(Bucket=BUCKET, Key=parquet_key, Body=buf.getvalue())
+              print(f"  Training parquet updated: {len(combined):,} rows "
+                    f"({combined['timestamp'].min()} → {combined['timestamp'].max()})")
+
+          # ── Ensemble retraining ──────────────────────────────────────────────
+
+          def retrain_ensemble():
+              print("Retraining Ensemble (XGBoost + RF + GB)...")
+              pip_install('scikit-learn==1.7.0', 'xgboost==3.2.0',
+                          'pandas==2.2.2', 'pyarrow==15.0.2', 'numpy==1.26.4')
+              import numpy as np, pandas as pd, pickle, tarfile, io as _io
+              from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+              from sklearn.preprocessing import RobustScaler
+              from sklearn.model_selection import train_test_split
+              from sklearn.metrics import mean_absolute_error
+              import xgboost as xgb
+
+              # Load parquet
+              obj = s3.get_object(Bucket=BUCKET, Key='training-data/btc_hourly.parquet')
+              df  = pd.read_parquet(_io.BytesIO(obj['Body'].read()))
+              df  = df.sort_values('timestamp').reset_index(drop=True)
+              print(f"  Loaded {len(df):,} rows "
+                    f"price ${df.price.min():,.0f}–${df.price.max():,.0f}")
+
+              # ── Feature engineering (matches ensemble_inference.py) ──────────
+              def _ema(prices, span):
+                  k, e = 2/(span+1), float(prices[0])
+                  for p in prices[1:]: e = float(p)*k + e*(1-k)
+                  return e
+
+              def _macd(prices, fast=12, slow=26, signal=9):
+                  kf, ks, kg = 2/(fast+1), 2/(slow+1), 2/(signal+1)
+                  ef = es = float(prices[0]); hist = []
+                  for p in prices:
+                      ef = float(p)*kf + ef*(1-kf)
+                      es = float(p)*ks + es*(1-ks)
+                      hist.append(ef - es)
+                  sig = hist[0]
+                  for m in hist[1:]: sig = m*kg + sig*(1-kg)
+                  return hist[-1], sig
+
+              LOOKBACK = 170; TARGET_LAG = 24
+              rows, targets = [], []
+              for i in range(LOOKBACK, len(df) - TARGET_LAG):
+                  w = df.iloc[i-LOOKBACK:i+1]
+                  p = w['price'].values; v = w['volume'].values
+                  N = len(p); feat = {}
+
+                  for ww in [6,12,24,48,168]:
+                      wn = min(ww, N)
+                      sma = float(np.mean(p[-wn:]))
+                      feat[f'sma_{ww}']           = sma
+                      feat[f'ema_{ww}']            = _ema(p[-wn:], ww)
+                      feat[f'price_vs_sma_{ww}']  = float(p[-1]/sma) if sma else 1.0
+
+                  for lag in [1,3,6,12,24,48,168]:
+                      idx = min(lag, N-1)
+                      feat[f'return_{lag}h']   = float((p[-1]-p[-1-idx])/p[-1-idx]) if p[-1-idx] else 0.0
+                      feat[f'price_lag_{lag}'] = float(p[-1-idx])
+
+                  for ww in [6,12,24,48]:
+                      wn = min(ww+1, N)
+                      rets = np.diff(p[-wn:]) / np.where(p[-wn:-1], p[-wn:-1], 1)
+                      feat[f'vol_{ww}'] = float(np.std(rets)) if len(rets) else 0.0
+
+                  win14 = min(15, N); diffs = np.diff(p[-win14:])
+                  ag = float(np.mean(diffs.clip(0)[-14:])) if len(diffs) >= 14 else float(np.mean(diffs.clip(0)))
+                  al = float(np.mean((-diffs).clip(0)[-14:])) if len(diffs) >= 14 else float(np.mean((-diffs).clip(0)))
+                  feat['rsi'] = 100 - 100/(1 + ag/al) if al else 100.0
+
+                  mv, ms = _macd(p[-max(26,N):] if N > 26 else p)
+                  feat.update({'macd': mv, 'macd_sig': ms, 'macd_hist': mv-ms})
+
+                  wn20 = min(20, N); bw = p[-wn20:]
+                  bm   = float(np.mean(bw)); bs = float(np.std(bw))
+                  bu, bl = bm+2*bs, bm-2*bs
+                  feat.update({'bb_upper': bu, 'bb_lower': bl,
+                               'bb_pos': float((p[-1]-bl)/(bu-bl)) if (bu-bl) else 0.5,
+                               'bb_width': float((bu-bl)/bm) if bm else 0.0})
+
+                  feat['volume'] = float(v[-1])
+                  for ww in [6,12,24]:
+                      wn = min(ww, len(v)); vsma = float(np.mean(v[-wn:]))
+                      feat[f'vol_sma_{ww}']   = vsma
+                      feat[f'vol_ratio_{ww}'] = float(v[-1]/vsma) if vsma else 1.0
+
+                  row_meta = df.iloc[i]
+                  s = float(row_meta.get('sentiment_score', 0.0))
+                  nc = float(row_meta.get('news_count', 10))
+                  feat.update({'sentiment_score': s, 'news_count': nc,
+                               'news_24h_sum': nc*24, 'sent_trend': 0.0})
+                  for ww in [3,6,12,24]:  feat[f'sent_sma_{ww}'] = s
+                  for l in [1,3,6,12]:    feat[f'sent_lag_{l}']  = s
+
+                  ts = df.iloc[i]['timestamp']
+                  if hasattr(ts, 'hour'):
+                      feat.update({
+                          'hour': float(ts.hour), 'dow': float(ts.dayofweek),
+                          'month': float(ts.month),
+                          'hour_sin': __import__('math').sin(2*3.14159*ts.hour/24),
+                          'hour_cos': __import__('math').cos(2*3.14159*ts.hour/24),
+                          'dow_sin':  __import__('math').sin(2*3.14159*ts.dayofweek/7),
+                          'dow_cos':  __import__('math').cos(2*3.14159*ts.dayofweek/7),
+                          'is_wknd':  float(ts.dayofweek >= 5),
+                      })
+                  else:
+                      feat.update({k: 0.0 for k in ['hour','dow','month',
+                                  'hour_sin','hour_cos','dow_sin','dow_cos','is_wknd']})
+
+                  rows.append(feat)
+                  targets.append(float(df.iloc[i+TARGET_LAG]['price']))
+
+              FEATURE_COLS = sorted(rows[0].keys())
+              X = np.array([[r.get(c,0.0) for c in FEATURE_COLS] for r in rows], dtype=float)
+              y = np.array(targets, dtype=float)
+
+              X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.15, shuffle=False)
+              scaler = RobustScaler()
+              y_tr_s = scaler.fit_transform(y_tr.reshape(-1,1)).flatten()
+
+              print("  Training XGBoost...")
+              xgb_m = xgb.XGBRegressor(n_estimators=400, max_depth=6, learning_rate=0.05,
+                                         subsample=0.8, colsample_bytree=0.8,
+                                         random_state=42, n_jobs=-1, tree_method='hist')
+              xgb_m.fit(X_tr, y_tr_s)
+
+              print("  Training RandomForest...")
+              rf_m = RandomForestRegressor(n_estimators=200, max_depth=8,
+                                           min_samples_leaf=5, random_state=42, n_jobs=-1)
+              rf_m.fit(X_tr, y_tr_s)
+
+              print("  Training GradientBoosting...")
+              from sklearn.ensemble import GradientBoostingRegressor
+              gb_m = GradientBoostingRegressor(n_estimators=300, max_depth=5,
+                                               learning_rate=0.05, subsample=0.8, random_state=42)
+              gb_m.fit(X_tr, y_tr_s)
+
+              ens_preds = scaler.inverse_transform(
+                  ((xgb_m.predict(X_te)+rf_m.predict(X_te)+gb_m.predict(X_te))/3).reshape(-1,1)
+              ).flatten()
+              mae = mean_absolute_error(y_te, ens_preds)
+              print(f"  Ensemble MAE: ${mae:,.0f} ({mae/np.mean(y_te)*100:.1f}%)")
+
+              # Package + upload
+              artifacts = {'xgboost': xgb_m, 'random_forest': rf_m,
+                           'gradient_boosting': gb_m, 'scaler': scaler,
+                           'feature_columns': FEATURE_COLS}
+              pkl_buf = _io.BytesIO()
+              pickle.dump(artifacts, pkl_buf)
+              pkl_buf.seek(0)
+
+              # Fetch the definitive inference.py from S3 (uploaded by deploy script;
+              # never contaminated by macOS AppleDouble resource-fork files).
+              inference_py = None
+              try:
+                  ref = s3.get_object(Bucket=BUCKET, Key='models/ensemble/inference.py')
+                  data = ref['Body'].read()
+                  data.decode('utf-8')          # will raise if binary
+                  if len(data) > 200:
+                      inference_py = data
+                      print(f"  Loaded inference.py from S3 reference ({len(data):,} bytes)")
+              except Exception as ex:
+                  print(f"  inference.py S3 reference unavailable ({ex}); falling back to tar extraction")
+
+              # Fallback: extract from existing model artifact (filter out AppleDouble files)
+              if inference_py is None:
+                  try:
+                      import tarfile as tf_mod, io as _io2
+                      cur = s3.get_object(Bucket=BUCKET, Key='models/ensemble/model.tar.gz')
+                      with tf_mod.open(fileobj=_io2.BytesIO(cur['Body'].read()), mode='r:gz') as tar:
+                          for m in tar.getmembers():
+                              basename = m.name.split('/')[-1]
+                              # Skip macOS AppleDouble resource forks (._<name>)
+                              if basename.startswith('._'):
+                                  continue
+                              if basename == 'inference.py':
+                                  candidate = tar.extractfile(m).read()
+                                  # Must be valid UTF-8 and non-trivially long
+                                  try:
+                                      candidate.decode('utf-8')
+                                      if len(candidate) > 100:
+                                          inference_py = candidate
+                                          break
+                                  except UnicodeDecodeError:
+                                      pass  # skip binary AppleDouble content
+                  except Exception as ex:
+                      print(f"  Warning: could not extract inference.py from tar: {ex}")
+
+              if inference_py is None:
+                  # Fallback: generate a minimal inference.py that loads the pkl
+                  inference_py = b'''import json, os, pickle, numpy as np\n\ndef model_fn(model_dir):\n    with open(os.path.join(model_dir, "ensemble.pkl"), "rb") as f:\n        return pickle.load(f)\n\ndef input_fn(body, ct):\n    return json.loads(body)\n\ndef predict_fn(inp, art):\n    price = float(inp.get("current_price", 50000))\n    return {"prediction": price, "price_24h": price}\n\ndef output_fn(pred, ct):\n    return json.dumps(pred)\n'''
+                  print("  Warning: using minimal fallback inference.py — real inference.py unavailable")
+
+              tar_buf = _io.BytesIO()
+              with tarfile.open(fileobj=tar_buf, mode='w:gz') as tar:
+                  def _add(name, data):
+                      info = tarfile.TarInfo(name=name); info.size = len(data)
+                      tar.addfile(info, _io.BytesIO(data))
+                  _add('ensemble.pkl', pkl_buf.getvalue())
+                  _add('inference.py', inference_py)
+                  cfg = json.dumps({'mae_usd': round(mae,2),
+                                    'retrained_at': datetime.now(timezone.utc).isoformat(),
+                                    'n_features': len(FEATURE_COLS)}).encode()
+                  _add('config.json', cfg)
+              tar_buf.seek(0)
+              s3.put_object(Bucket=BUCKET, Key='models/ensemble/model.tar.gz',
+                            Body=tar_buf.getvalue())
+              print(f"  Ensemble model uploaded (MAE ${mae:,.0f})")
+              return mae
+
+          # ── LSTM: submit SageMaker Training Job ──────────────────────────────
+
+          def submit_lstm_training_job():
+              """
+              Kick off LSTM Training Job on SageMaker.
+              Tries GPU (ml.g4dn.xlarge) first; falls back to CPU (ml.m5.4xlarge)
+              if the account has no GPU training quota.
+              """
+              print("Submitting LSTM SageMaker Training Job...")
+              job_name = f'lstm-retrain-{datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")}'
+
+              # Prefer GPU; fall back to CPU if quota is 0
+              # TF 2.19 CPU image — confirmed available in eu-west-2
+              CPU_IMAGE = (f'763104351884.dkr.ecr.{REGION}.amazonaws.com/'
+                           f'tensorflow-training:2.19.0-cpu-py312-ubuntu22.04-sagemaker-v1.9')
+              INSTANCE_TYPES = [
+                  ('ml.g4dn.xlarge',
+                   f'763104351884.dkr.ecr.{REGION}.amazonaws.com/'
+                   f'tensorflow-training:2.19.0-gpu-py312-cu122-ubuntu22.04-sagemaker-v1.9'),
+                  ('ml.m5.4xlarge',  CPU_IMAGE),
+                  ('ml.c5.4xlarge',  CPU_IMAGE),
+              ]
+
+              last_err = None
+              for instance_type, tf_image in INSTANCE_TYPES:
+                  try:
+                      print(f"  Trying instance: {instance_type}")
+                      sm.create_training_job(
+                          TrainingJobName=job_name,
+                          AlgorithmSpecification={
+                              'TrainingImage':     tf_image,
+                              'TrainingInputMode': 'File',
+                          },
+                          RoleArn=os.environ['SAGEMAKER_ROLE_ARN'],
+                          InputDataConfig=[{
+                              'ChannelName': 'training',
+                              'DataSource': {
+                                  'S3DataSource': {
+                                      'S3DataType':             'S3Prefix',
+                                      'S3Uri':                  f's3://{BUCKET}/training-data/',
+                                      'S3DataDistributionType': 'FullyReplicated',
+                                  }
+                              },
+                              'ContentType': 'application/octet-stream',
+                          }],
+                          OutputDataConfig={
+                              'S3OutputPath': f's3://{BUCKET}/models/deeplearning-training/'
+                          },
+                          ResourceConfig={
+                              'InstanceType':   instance_type,
+                              'InstanceCount':  1,
+                              'VolumeSizeInGB': 50,
+                          },
+                          StoppingCondition={'MaxRuntimeInSeconds': 28800},  # 8h max
+                          HyperParameters={
+                              # Script Mode: tells TF container which file to run
+                              'sagemaker_program':          'deep-learning-training.py',
+                              'sagemaker_submit_directory': f's3://{BUCKET}/training-scripts/lstm_source.tar.gz',
+                              # Passed to the training script as --key=value args
+                              'epochs':       '100',
+                              'batch-size':   '32',
+                              's3-bucket':    BUCKET,
+                              's3-data-path': 'training-data/btc_hourly.parquet',
+                              's3-prefix':    'models/deeplearning',
+                              'region':       REGION,
+                          },
+                      )
+                      print(f"  ✅ Training Job submitted on {instance_type}: {job_name}")
+                      last_err = None
+                      break  # success
+                  except sm.exceptions.ResourceLimitExceeded as e:
+                      print(f"  Quota exceeded for {instance_type}: {e}")
+                      last_err = e
+                      continue
+                  except Exception as e:
+                      raise  # unexpected error — surface it
+
+              if last_err:
+                  raise last_err  # all instance types exhausted
+              # Store job name so a completion handler can bump the endpoint version
+              ssm.put_parameter(
+                  Name=f'/bitcoin-prediction/{os.environ["ENVIRONMENT"]}/lstm-training-job',
+                  Value=job_name, Type='String', Overwrite=True
+              )
+              print(f"  LSTM Training Job submitted: {job_name}")
+              return job_name
+
+          # ── Update SageMaker endpoint with new S3 artifact ───────────────────
+
+          def update_endpoint(model_base_name, endpoint_name, endpoint_config_base,
+                               ecr_image, s3_model_path, memory_mb):
+              """Create a new model+config and update the live endpoint."""
+              # Use compact timestamp (%m%d%H%M = 8 chars) to keep names ≤ 63 chars
+              # (SageMaker endpoint config name limit is 63 characters)
+              timestamp = datetime.now(timezone.utc).strftime('%m%d%H%M')
+              model_name  = f'{model_base_name}-{timestamp}'
+              config_name = f'{endpoint_config_base}-{timestamp}'
+              role_arn    = os.environ['SAGEMAKER_ROLE_ARN']
+
+              sm.create_model(
+                  ModelName=model_name,
+                  ExecutionRoleArn=role_arn,
+                  PrimaryContainer={
+                      'Image':        ecr_image,
+                      'ModelDataUrl': f's3://{BUCKET}/{s3_model_path}',
+                      'Environment':  {'SAGEMAKER_PROGRAM': 'inference.py',
+                                       'SAGEMAKER_REGION': REGION},
+                  }
+              )
+              sm.create_endpoint_config(
+                  EndpointConfigName=config_name,
+                  ProductionVariants=[{
+                      'VariantName':    'primary',
+                      'ModelName':      model_name,
+                      'ServerlessConfig': {
+                          'MemorySizeInMB': memory_mb,
+                          'MaxConcurrency': 2,
+                      }
+                  }]
+              )
+              sm.update_endpoint(EndpointName=endpoint_name, EndpointConfigName=config_name)
+              # Wait for endpoint to be in service (up to 10 min)
+              waiter = sm.get_waiter('endpoint_in_service')
+              waiter.wait(EndpointName=endpoint_name,
+                          WaiterConfig={'Delay': 30, 'MaxAttempts': 20})
+              print(f"  Endpoint {endpoint_name} updated → {model_name}")
+
+          # ── Main handler ─────────────────────────────────────────────────────
+
+          def lambda_handler(event, context):
+              env  = os.environ.get('ENVIRONMENT', 'production')
+              print(f"=== Weekly Retraining — {datetime.now(timezone.utc).isoformat()} ===")
+
+              step = event.get('step', 'all')
+
+              # Step 1: Refresh training data
+              if step in ('all', 'data'):
+                  refresh_training_data()
+
+              # Step 2: Retrain Ensemble
+              if step in ('all', 'ensemble'):
+                  retrain_ensemble()
+                  update_endpoint(
+                      model_base_name=f'bitcoin-ensemble-model-retrain-{env}',
+                      endpoint_name=f'bitcoin-ensemble-serverless-{env}',
+                      endpoint_config_base=f'bitcoin-ensemble-serverless-config-retrain-{env}',
+                      ecr_image=os.environ['ENSEMBLE_ECR_IMAGE'],
+                      s3_model_path='models/ensemble/model.tar.gz',
+                      memory_mb=2048,
+                  )
+
+              # Step 3: Submit LSTM Training Job (async — runs for ~4h on GPU)
+              if step in ('all', 'lstm'):
+                  submit_lstm_training_job()
+
+              print("=== Weekly Retraining complete ===")
+              return {'statusCode': 200,
+                      'retrained_at': datetime.now(timezone.utc).isoformat()}
+
+  WeeklyRetrainingPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WeeklyRetrainingFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt WeeklyRetrainingRule.Arn
+
+  WeeklyRetrainingRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'bitcoin-weekly-retrain-${Environment}'
+      Description: 'Weekly model retraining — Sunday 02:00 UTC'
+      ScheduleExpression: 'cron(0 2 ? * SUN *)'
+      State: ENABLED
+      Targets:
+        - Id: WeeklyRetrain
+          Arn: !GetAtt WeeklyRetrainingFunction.Arn
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # LSTM POST-TRAINING — auto-deploys new model when SageMaker job completes
+  # EventBridge fires on "SageMaker Training Job State Change" → Completed
+  # Lambda: copies output → repacks with reference inference.py → updates endpoint
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  LstmPostTrainingFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'bitcoin-lstm-post-training-${Environment}'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      MemorySize: 512
+      Timeout: 600          # 10 min — download + repack + endpoint update
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          DATA_BUCKET:       !Ref DataBucketName
+          ENVIRONMENT:       !Ref Environment
+          SAGEMAKER_ROLE_ARN: !GetAtt SageMakerExecutionRole.Arn
+          LSTM_ECR_IMAGE:    !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/bitcoin-lstm:latest'
+          ALERT_TOPIC_ARN:   !Ref AlertTopic
+      Code:
+        ZipFile: |
+          """
+          LSTM Post-Training Lambda.
+
+          Triggered by EventBridge when an lstm-retrain-* SageMaker Training Job
+          reaches Completed status.
+
+          Steps:
+            1. Download the job's output model.tar.gz from S3.
+            2. Extract model files (lstm_model.h5 / .keras, scalers.pkl, config.json).
+            3. Fetch the reference inference.py from models/deeplearning/inference.py.
+            4. Repack into a clean tar.gz (no macOS AppleDouble files).
+            5. Upload to models/deeplearning/model.tar.gz (replaces existing).
+            6. Create new SageMaker Model + EndpointConfig.
+            7. Call update_endpoint on bitcoin-deeplearning-serverless-{env}.
+            8. Publish SNS success/failure notification.
+          """
+          import json, os, io, tarfile, boto3
+          from datetime import datetime, timezone
+
+          REGION   = os.environ.get('AWS_REGION', 'eu-west-2')
+          BUCKET   = os.environ['DATA_BUCKET']
+          ENV      = os.environ['ENVIRONMENT']
+          ROLE_ARN = os.environ['SAGEMAKER_ROLE_ARN']
+          ECR_IMG  = os.environ['LSTM_ECR_IMAGE']
+          SNS_ARN  = os.environ['ALERT_TOPIC_ARN']
+
+          s3  = boto3.client('s3',        region_name=REGION)
+          sm  = boto3.client('sagemaker', region_name=REGION)
+          sns = boto3.client('sns',       region_name=REGION)
+
+          ENDPOINT_NAME = f'bitcoin-deeplearning-serverless-{ENV}'
+
+          def lambda_handler(event, context):
+              # EventBridge passes the training job detail
+              detail   = event.get('detail', {})
+              job_name = detail.get('TrainingJobName', '')
+              status   = detail.get('TrainingJobStatus', '')
+
+              print(f"[post-train] job={job_name} status={status}")
+
+              if not job_name.startswith('lstm-retrain-'):
+                  print("  Not an lstm-retrain job — skipping")
+                  return {'statusCode': 200, 'skipped': True}
+
+              if status != 'Completed':
+                  msg = f"LSTM training job {job_name} ended with status: {status}"
+                  print(f"  {msg}")
+                  sns.publish(TopicArn=SNS_ARN, Subject='⚠️ LSTM Training Failed',
+                              Message=msg)
+                  return {'statusCode': 200, 'status': status}
+
+              # ── Deduplication: EventBridge delivers at-least-once ────────────
+              # Use S3 conditional write (IfNoneMatch=*) as an atomic mutex.
+              # Only the first invocation for this job will succeed; subsequent
+              # duplicates will find the lock file already present and skip.
+              lock_key = f'locks/post-train/{job_name}.lock'
+              try:
+                  s3.put_object(
+                      Bucket=BUCKET,
+                      Key=lock_key,
+                      Body=context.aws_request_id.encode(),
+                      IfNoneMatch='*',          # atomic: fail if key already exists
+                  )
+                  print(f"  Lock acquired: {lock_key}")
+              except Exception as lock_err:
+                  if 'PreconditionFailed' in str(lock_err) or '412' in str(lock_err):
+                      print(f"  Duplicate event for {job_name} — already processed, skipping")
+                      return {'statusCode': 200, 'duplicate': True, 'job': job_name}
+                  raise  # unexpected error — let it propagate
+
+              try:
+                  result = deploy_new_model(job_name)
+                  sns.publish(
+                      TopicArn=SNS_ARN,
+                      Subject='✅ LSTM Model Auto-Deployed',
+                      Message=(
+                          f"LSTM retraining complete.\n"
+                          f"Job:      {job_name}\n"
+                          f"Endpoint: {ENDPOINT_NAME}\n"
+                          f"Config:   {result['config_name']}\n"
+                          f"Deployed: {datetime.now(timezone.utc).isoformat()}"
+                      )
+                  )
+                  print(f"  ✅ Deployed: {result}")
+                  return {'statusCode': 200, **result}
+              except Exception as e:
+                  err = str(e)
+                  print(f"  ❌ Deployment failed: {err}")
+                  sns.publish(TopicArn=SNS_ARN,
+                              Subject='❌ LSTM Auto-Deploy Failed',
+                              Message=f"Job: {job_name}\nError: {err}")
+                  raise
+
+          def deploy_new_model(job_name):
+              # ── 1. Locate training output ────────────────────────────────────
+              desc       = sm.describe_training_job(TrainingJobName=job_name)
+              output_uri = desc['OutputDataConfig']['S3OutputPath'].rstrip('/')
+              # SageMaker appends job_name/output/model.tar.gz
+              output_key = f"{output_uri.split('/', 3)[-1]}/{job_name}/output/model.tar.gz"
+              print(f"  Output key: {output_key}")
+
+              # ── 2. Download training output ──────────────────────────────────
+              # Some training scripts write directly to the canonical S3 path rather
+              # than via SageMaker's /opt/ml/model mechanism. Fall back gracefully.
+              FALLBACK_KEY = 'models/deeplearning/model.tar.gz'
+              try:
+                  obj       = s3.get_object(Bucket=BUCKET, Key=output_key)
+                  raw_bytes = obj['Body'].read()
+                  print(f"  Downloaded from SageMaker output: {len(raw_bytes)/1e6:.1f} MB")
+              except s3.exceptions.NoSuchKey:
+                  print(f"  ⚠️ SageMaker output path not found — training script wrote directly to {FALLBACK_KEY}")
+                  obj       = s3.get_object(Bucket=BUCKET, Key=FALLBACK_KEY)
+                  raw_bytes = obj['Body'].read()
+                  print(f"  Downloaded from fallback path: {len(raw_bytes)/1e6:.1f} MB")
+
+              # ── 3. Extract model files ───────────────────────────────────────
+              MODEL_FILES = {'lstm_model.h5', 'lstm_model.keras', 'scalers.pkl',
+                             'config.json', 'lstm_model'}   # lstm_model = SavedModel dir
+              extracted = {}
+              with tarfile.open(fileobj=io.BytesIO(raw_bytes), mode='r:gz') as tar:
+                  for member in tar.getmembers():
+                      basename = member.name.lstrip('./').split('/')[-1]
+                      if basename.startswith('._'):
+                          continue   # skip macOS AppleDouble files
+                      # Match exact filenames or SavedModel directory entries
+                      top = member.name.lstrip('./').split('/')[0]
+                      if top in MODEL_FILES or basename in MODEL_FILES:
+                          f = tar.extractfile(member)
+                          if f:
+                              extracted[member.name.lstrip('./')] = f.read()
+              print(f"  Extracted {len(extracted)} entries: {list(extracted.keys())[:6]}")
+
+              # ── 4. Fetch reference inference.py ──────────────────────────────
+              try:
+                  ref_obj      = s3.get_object(Bucket=BUCKET,
+                                               Key='models/deeplearning/inference.py')
+                  inference_py = ref_obj['Body'].read()
+                  inference_py.decode('utf-8')   # validate it's text
+                  print(f"  Reference inference.py: {len(inference_py):,} bytes")
+              except Exception as ex:
+                  raise RuntimeError(f"Could not fetch reference inference.py: {ex}")
+
+              # ── 5. Repack into clean tar.gz ──────────────────────────────────
+              buf = io.BytesIO()
+              with tarfile.open(fileobj=buf, mode='w:gz') as out_tar:
+                  def _add(name, data):
+                      info = tarfile.TarInfo(name=name)
+                      info.size = len(data)
+                      out_tar.addfile(info, io.BytesIO(data))
+
+                  # Add all extracted model files
+                  for path, data in extracted.items():
+                      _add(path, data)
+                  # Always use reference inference.py (never the one from training output)
+                  _add('inference.py', inference_py)
+
+              buf.seek(0)
+              new_bytes = buf.getvalue()
+              print(f"  Repacked: {len(new_bytes)/1e6:.1f} MB")
+
+              # ── 6. Upload to canonical S3 path ───────────────────────────────
+              s3.put_object(Bucket=BUCKET, Key='models/deeplearning/model.tar.gz',
+                            Body=new_bytes)
+              print("  Uploaded → models/deeplearning/model.tar.gz")
+
+              # ── 7. Create new SageMaker Model + EndpointConfig ───────────────
+              ts          = datetime.now(timezone.utc).strftime('%m%d%H%M')
+              model_name  = f'bitcoin-dl-model-{ENV}-{ts}'          # ≤ 63 chars
+              config_name = f'bitcoin-dl-cfg-{ENV}-{ts}'            # ≤ 63 chars
+
+              sm.create_model(
+                  ModelName=model_name,
+                  ExecutionRoleArn=ROLE_ARN,
+                  PrimaryContainer={
+                      'Image':        ECR_IMG,
+                      'ModelDataUrl': f's3://{BUCKET}/models/deeplearning/model.tar.gz',
+                      'Environment':  {'SAGEMAKER_PROGRAM': 'inference.py',
+                                       'SAGEMAKER_REGION':  REGION},
+                  }
+              )
+              sm.create_endpoint_config(
+                  EndpointConfigName=config_name,
+                  ProductionVariants=[{
+                      'VariantName': 'primary',
+                      'ModelName':   model_name,
+                      'ServerlessConfig': {
+                          'MemorySizeInMB': 3072,
+                          'MaxConcurrency': 2,
+                      }
+                  }]
+              )
+
+              # ── 8. Update live endpoint ──────────────────────────────────────
+              sm.update_endpoint(EndpointName=ENDPOINT_NAME,
+                                 EndpointConfigName=config_name)
+              print(f"  update_endpoint → {config_name} (async; will be InService in ~2 min)")
+
+              return {'model_name': model_name, 'config_name': config_name,
+                      'job_name': job_name}
+
+  LstmPostTrainingPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LstmPostTrainingFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt LstmPostTrainingRule.Arn
+
+  LstmPostTrainingRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'bitcoin-lstm-post-training-${Environment}'
+      Description: 'Fire when an lstm-retrain-* SageMaker training job completes or fails'
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.sagemaker
+        detail-type:
+          - SageMaker Training Job State Change
+        detail:
+          TrainingJobStatus:
+            - Completed
+            - Failed
+            - Stopped
+          TrainingJobName:
+            - prefix: lstm-retrain-
+      Targets:
+        - Id: LstmPostTrain
+          Arn: !GetAtt LstmPostTrainingFunction.Arn
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # ACCURACY TRACKER — daily feedback loop; fires 07:30 UTC (08:30 BST)
+  # Reads yesterday's final prediction, fetches actual BTC price from
+  # CoinGecko, calculates error %, stores to S3, sends 7-day rolling
+  # accuracy summary email so you can see if retraining is improving things.
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  AccuracyTrackerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'bitcoin-accuracy-tracker-${Environment}'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      MemorySize: 256
+      Timeout: 60
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          DATA_BUCKET:      !Ref DataBucketName
+          ENVIRONMENT:      !Ref Environment
+          PREDICTIONS_TABLE: !Ref PredictionsTable
+          ALERT_TOPIC_ARN:  !Ref AlertTopic
+      Code:
+        ZipFile: |
+          """
+          Daily accuracy tracker.
+          Fires at 07:30 UTC. Reads yesterday's final_prediction from DynamoDB,
+          fetches the current BTC price as "actual" (≈24h after evening prediction),
+          stores error to S3, builds 7-day rolling summary, sends email.
+          """
+          import json, os, boto3
+          from datetime import datetime, timezone, timedelta
+          from urllib.request import urlopen, Request
+
+          BUCKET  = os.environ['DATA_BUCKET']
+          TABLE   = os.environ['PREDICTIONS_TABLE']
+          SNS_ARN = os.environ['ALERT_TOPIC_ARN']
+          REGION  = os.environ.get('AWS_REGION', 'eu-west-2')
+
+          s3     = boto3.client('s3',        region_name=REGION)
+          dynamo = boto3.resource('dynamodb', region_name=REGION)
+          sns    = boto3.client('sns',        region_name=REGION)
+
+          def fetch_current_price():
+              url = 'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd'
+              req = Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+              data = json.loads(urlopen(req, timeout=10).read())
+              return float(data['bitcoin']['usd'])
+
+          def load_accuracy_records(n=7):
+              records = []
+              today = datetime.now(timezone.utc).date()
+              for i in range(1, n + 8):   # look back extra days in case some are missing
+                  d = (today - timedelta(days=i)).isoformat()
+                  try:
+                      obj = s3.get_object(Bucket=BUCKET, Key=f'accuracy/{d}.json')
+                      records.append(json.loads(obj['Body'].read()))
+                  except Exception:
+                      pass
+                  if len(records) >= n:
+                      break
+              return sorted(records, key=lambda r: r['date'])  # oldest first
+
+          def lambda_handler(event, context):
+              today     = datetime.now(timezone.utc).date()
+              yesterday = (today - timedelta(days=1)).isoformat()
+
+              # ── 1. Read yesterday's final prediction from DynamoDB ───────────
+              table  = dynamo.Table(TABLE)
+              record = None
+              for run in ['evening', 'morning']:
+                  resp = table.get_item(Key={'date': yesterday, 'run_type': run})
+                  item = resp.get('Item')
+                  if item and ('final_prediction' in item or 'prediction' in item):
+                      record = item
+                      break
+
+              if record is None:
+                  print(f"No prediction record for {yesterday} — skipping accuracy check")
+                  return {'statusCode': 200, 'skipped': True}
+
+              predicted = float(record.get('final_prediction') or record.get('prediction'))
+
+              # ── 2. Fetch actual current price ────────────────────────────────
+              try:
+                  actual = fetch_current_price()
+              except Exception as e:
+                  print(f"CoinGecko fetch failed: {e}")
+                  return {'statusCode': 200, 'error': str(e)}
+
+              error_usd = actual - predicted
+              error_pct = abs(error_usd) / actual * 100
+
+              # ── 3. Store accuracy record to S3 ───────────────────────────────
+              acc_record = {
+                  'date':         yesterday,
+                  'predicted':    round(predicted, 2),
+                  'actual':       round(actual, 2),
+                  'error_usd':    round(error_usd, 2),
+                  'error_pct':    round(error_pct, 2),
+                  'direction':    'above' if predicted > actual else 'below',
+                  'checked_at':   datetime.now(timezone.utc).isoformat(),
+              }
+              s3.put_object(
+                  Bucket=BUCKET,
+                  Key=f'accuracy/{yesterday}.json',
+                  Body=json.dumps(acc_record),
+                  ContentType='application/json'
+              )
+              print(f"Accuracy {yesterday}: predicted=${predicted:,.0f} actual=${actual:,.0f} "
+                    f"error={error_pct:.1f}%")
+
+              # ── 4. Build 7-day rolling summary ───────────────────────────────
+              history = load_accuracy_records(n=7)
+
+              if history:
+                  avg_err    = sum(r['error_pct'] for r in history) / len(history)
+                  best       = min(history, key=lambda r: r['error_pct'])
+                  worst      = max(history, key=lambda r: r['error_pct'])
+                  over_count = sum(1 for r in history if r['direction'] == 'above')
+                  under_count= len(history) - over_count
+
+                  rows = '\n'.join(
+                      f"  {r['date']}  predicted ${r['predicted']:>9,.0f}  "
+                      f"actual ${r['actual']:>9,.0f}  "
+                      f"{'▲' if r['direction']=='above' else '▼'} "
+                      f"{r['error_pct']:.1f}%"
+                      for r in history
+                  )
+
+                  trend_emoji = '📈' if avg_err <= 3.0 else '📉' if avg_err >= 6.0 else '➡️'
+                  message = (
+                      f"📋 DAILY ACCURACY REPORT — {yesterday}\n"
+                      f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                      f"Yesterday:  predicted ${predicted:,.0f}  →  actual ${actual:,.0f}\n"
+                      f"Error: {'▲' if predicted > actual else '▼'} ${abs(error_usd):,.0f} ({error_pct:.1f}%)\n\n"
+                      f"7-Day Rolling Performance {trend_emoji}\n"
+                      f"  Average error:  {avg_err:.1f}%\n"
+                      f"  Predicted high: {over_count}x  |  Predicted low: {under_count}x\n"
+                      f"  Best day:  {best['date']} ({best['error_pct']:.1f}% off)\n"
+                      f"  Worst day: {worst['date']} ({worst['error_pct']:.1f}% off)\n\n"
+                      f"History:\n{rows}\n\n"
+                      f"(Morning pipeline runs at 08:00 BST with today's prediction.)"
+                  )
+              else:
+                  message = (
+                      f"📋 ACCURACY REPORT — {yesterday}\n"
+                      f"Predicted: ${predicted:,.0f}  Actual: ${actual:,.0f}\n"
+                      f"Error: {error_pct:.1f}% ({'above' if predicted > actual else 'below'})\n\n"
+                      f"7-day history will build up over the coming week."
+                  )
+
+              sns.publish(
+                  TopicArn=SNS_ARN,
+                  Subject=f'📋 Bitcoin Accuracy Report — {error_pct:.1f}% error yesterday',
+                  Message=message
+              )
+
+              return {
+                  'statusCode':   200,
+                  'date':         yesterday,
+                  'predicted':    predicted,
+                  'actual':       actual,
+                  'error_pct':    round(error_pct, 2),
+              }
+
+  AccuracyTrackerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AccuracyTrackerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AccuracyTrackerRule.Arn
+
+  AccuracyTrackerRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'bitcoin-accuracy-tracker-${Environment}'
+      Description: 'Daily accuracy report — fires 07:30 UTC (08:30 BST), before morning prediction'
+      ScheduleExpression: 'cron(30 7 * * ? *)'
+      State: ENABLED
+      Targets:
+        - Id: AccuracyTracker
+          Arn: !GetAtt AccuracyTrackerFunction.Arn
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # CLOUDWATCH — LEAN MONITORING (errors + cost alert only)
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  PipelineErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'BitcoinPipeline-Errors-${Environment}'
+      AlarmDescription: 'One or more pipeline Lambda functions errored'
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Statistic: Sum
+      Period: 86400           # 24-hour window
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref PipelineCoordinatorFunction
+      AlarmActions:
+        - !Ref AlertTopic
+      TreatMissingData: notBreaching
+
+  # ─────────────────────────────────────────────
+  # OUTPUTS
+  # ─────────────────────────────────────────────
+Outputs:
+
+  DataBucket:
+    Description: S3 bucket for raw data, features, and model artifacts
+    Value: !Ref DataBucketName
+    Export:
+      Name: !Sub '${AWS::StackName}-DataBucket'
+
+  PredictionsTable:
+    Description: DynamoDB table storing morning/evening predictions
+    Value: !Ref PredictionsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-PredictionsTable'
+
+  AlertTopicArn:
+    Description: SNS topic ARN for prediction emails and submission reminders
+    Value: !Ref AlertTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-AlertTopic'
+
+  EnsembleEndpointName:
+    Description: SageMaker Serverless endpoint — Ensemble (XGBoost/RF)
+    Value: !Sub 'bitcoin-ensemble-serverless-${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-EnsembleEndpoint'
+
+  DeepLearningEndpointName:
+    Description: SageMaker Serverless endpoint — Deep Learning (LSTM/GRU)
+    Value: !Sub 'bitcoin-deeplearning-serverless-${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DeepLearningEndpoint'
+
+  SentimentEndpointName:
+    Description: SageMaker Serverless endpoint — Sentiment (BERT)
+    Value: !Sub 'bitcoin-sentiment-serverless-${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-SentimentEndpoint'
+
+  TimeSeriesEndpointName:
+    Description: SageMaker Serverless endpoint — Time Series (ARIMA/Prophet)
+    Value: !Sub 'bitcoin-timeseries-serverless-${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-TimeSeriesEndpoint'
+
+  SageMakerRoleArn:
+    Description: IAM role ARN for SageMaker execution
+    Value: !GetAtt SageMakerExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SageMakerRole'
+
+  MorningSchedule:
+    Description: Morning pipeline schedule (08:00 BST / 07:00 UTC)
+    Value: 'cron(0 7 * * ? *)'
+
+  EveningSchedule:
+    Description: Evening pipeline schedule (21:00 BST / 20:00 UTC)
+    Value: 'cron(0 20 * * ? *)'
+
+  SubmissionReminderSchedule:
+    Description: Submission reminder schedule (23:30 BST / 22:30 UTC)
+    Value: 'cron(30 22 * * ? *)'

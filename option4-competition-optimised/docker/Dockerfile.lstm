@@ -1,0 +1,27 @@
+# ── LSTM/GRU deep-learning container (TensorFlow CPU) ────────────────────────
+# Version must match training: tensorflow 2.16.2 (saved as H5 format)
+# Note: model was trained with tensorflow-macos 2.16.x on M2;
+#       tensorflow-cpu 2.16.x can load and serve H5 models cross-platform.
+
+FROM python:3.10-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir \
+    flask==3.0.3 \
+    gunicorn==21.2.0 \
+    tensorflow-cpu==2.16.2 \
+    scikit-learn==1.7.0 \
+    numpy==1.26.4 \
+    pandas==2.2.2 \
+    boto3==1.34.0
+
+WORKDIR /opt/program
+COPY serve.py /opt/program/serve.py
+
+EXPOSE 8080
+ENV PYTHONUNBUFFERED=1
+
+ENTRYPOINT ["gunicorn", "--bind", "0.0.0.0:8080", "--timeout", "120", "--workers", "1", "serve:app"]
