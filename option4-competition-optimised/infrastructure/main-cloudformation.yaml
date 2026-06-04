@@ -1073,13 +1073,16 @@ Resources:
                   dl_s   = f"${deeplearning_pred:,.0f}"  if deeplearning_pred  else "FAILED"
                   sent_s = f"${sentiment_pred:,.0f}"     if sentiment_pred     else "FAILED"
                   ts_s   = f"${timeseries_pred:,.0f}"    if timeseries_pred    else "FAILED"
+                  m_change_pct = ((run_prediction - current_price_now) / current_price_now * 100) if current_price_now else 0
+                  m_arrow = '▲' if run_prediction > current_price_now else '▼'
                   message = (
                       f"📊 MORNING PREDICTION ({date})\n\n"
-                      f"BTC predicted price: ${run_prediction:,.0f}\n\n"
+                      f"Current BTC price:  ${current_price_now:,.0f}\n"
+                      f"Predicted (24h):    ${run_prediction:,.0f}  {m_arrow} {abs(m_change_pct):.1f}%\n\n"
                       f"Model breakdown:\n"
                       f"  • Ensemble (XGBoost/RF): {ens_s}\n"
                       f"  • Deep Learning (LSTM):  {dl_s}\n"
-                      f"  • Sentiment (BERT):       {sent_s}\n"
+                      f"  • Sentiment (BERT):      {sent_s}\n"
                       f"  • Time Series (ARIMA):   {ts_s}\n\n"
                       f"Evening pipeline at 22:30 GMT will refine this.\n"
                       f"Reminder email at 23:30 GMT — submit before midnight."
@@ -1133,11 +1136,15 @@ Resources:
                   dl_s   = f"${deeplearning_pred:,.0f}"  if deeplearning_pred  else "FAILED"
                   sent_s = f"${sentiment_pred:,.0f}"     if sentiment_pred     else "FAILED"
                   ts_s   = f"${timeseries_pred:,.0f}"    if timeseries_pred    else "FAILED"
+                  change_pct = ((final_prediction - current_price_now) / current_price_now * 100) if current_price_now else 0
+                  direction_arrow = '▲' if final_prediction > current_price_now else '▼'
                   message = (
                       f"🎯 FINAL PREDICTION ({date})\n"
                       f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                       f"SUBMIT THIS TO RAINFACE: ${final_prediction:,.0f}\n"
                       f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                      f"\nCurrent BTC price:  ${current_price_now:,.0f}\n"
+                      f"Predicted (24h):    ${final_prediction:,.0f}  {direction_arrow} {abs(change_pct):.1f}%\n"
                       f"{divergence_warning}\n"
                       f"How it was calculated:\n"
                       f"{morning_line} (30% weight)\n"
@@ -1145,9 +1152,9 @@ Resources:
                       f"Evening model breakdown:\n"
                       f"  • Ensemble (XGBoost/RF): {ens_s}\n"
                       f"  • Deep Learning (LSTM):  {dl_s}\n"
-                      f"  • Sentiment (BERT):       {sent_s}\n"
+                      f"  • Sentiment (BERT):      {sent_s}\n"
                       f"  • Time Series (ARIMA):   {ts_s}\n\n"
-                      f"⏰ Submit at rainface.finance before midnight BST."
+                      f"⏰ Submit at rainface.finance before midnight GMT."
                   )
 
               # Publish SNS notification
