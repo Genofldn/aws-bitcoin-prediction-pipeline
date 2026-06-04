@@ -1292,9 +1292,10 @@ Resources:
   # ═══════════════════════════════════════════════════════════════════════════
   # EVENTBRIDGE SCHEDULES
   # All times in GMT.
-  # Morning:  07:00 GMT
-  # Evening:  22:30 GMT  (freshest data, ~1h before reminder)
-  # Reminder: 23:30 GMT  (submit before midnight)
+  # Morning:     07:00 GMT  — 30% weight prediction
+  # Evening:     22:30 GMT  — 70% weight prediction (freshest data)
+  # Final Check: 23:00 GMT  — standalone run, all 4 models fresh, no blending with
+  #                           morning/evening; pure market snapshot before submission
   # ═══════════════════════════════════════════════════════════════════════════
 
   MorningPipelineRule:
@@ -1321,38 +1322,209 @@ Resources:
           Arn: !GetAtt PipelineCoordinatorFunction.Arn
           Input: !Sub '{"run_type": "evening"}'
 
-  # 23:30 GMT reminder — SNS fires directly (no Lambda needed).
-  # Reminds you to go to rainface.finance and submit tonight's prediction.
-  SubmissionReminderRule:
+  # ── Final Check Lambda ────────────────────────────────────────────────────
+  # Fires at 23:00 GMT. Runs all 4 models fresh on live data.
+  # Standalone blend — no morning/evening influence. Pure market snapshot.
+  FinalCheckFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'bitcoin-final-check-${Environment}'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      MemorySize: 512
+      Timeout: 300
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          DATA_BUCKET:          !Ref DataBucketName
+          ALERT_TOPIC_ARN:      !Ref AlertTopic
+          ENVIRONMENT:          !Ref Environment
+          ENSEMBLE_ENDPOINT:    !Sub 'bitcoin-ensemble-serverless-${Environment}'
+          DEEPLEARNING_ENDPOINT: !Sub 'bitcoin-deeplearning-serverless-${Environment}'
+          SENTIMENT_ENDPOINT:   !Sub 'bitcoin-sentiment-serverless-${Environment}'
+          TIMESERIES_ENDPOINT:  !Sub 'bitcoin-timeseries-serverless-${Environment}'
+      Code:
+        ZipFile: |
+          """
+          Final Check Lambda — fires at 23:00 GMT.
+          Runs all 4 SageMaker models on the latest evening features.
+          Produces a standalone blend (no morning/evening weighting) and
+          emails a clear SUBMIT recommendation with 1 hour to midnight.
+          Uses dynamic weights from S3 if 7+ days of accuracy data available.
+          """
+          import json, os, boto3
+          from datetime import datetime, timezone
+          from urllib.request import urlopen, Request
+
+          BUCKET  = os.environ['DATA_BUCKET']
+          SNS_ARN = os.environ['ALERT_TOPIC_ARN']
+          REGION  = os.environ.get('AWS_REGION', 'eu-west-2')
+
+          s3         = boto3.client('s3',               region_name=REGION)
+          sm_runtime = boto3.client('sagemaker-runtime', region_name=REGION)
+          sns        = boto3.client('sns',               region_name=REGION)
+
+          MODEL_NAMES = ['ensemble', 'deeplearning', 'sentiment', 'timeseries']
+          LABELS = {
+              'ensemble':     'Ensemble (XGBoost/RF)',
+              'deeplearning': 'Deep Learning (LSTM)',
+              'sentiment':    'Sentiment (BERT)',
+              'timeseries':   'Time Series (ARIMA)',
+          }
+          ENDPOINTS = {
+              'ensemble':     os.environ['ENSEMBLE_ENDPOINT'],
+              'deeplearning': os.environ['DEEPLEARNING_ENDPOINT'],
+              'sentiment':    os.environ['SENTIMENT_ENDPOINT'],
+              'timeseries':   os.environ['TIMESERIES_ENDPOINT'],
+          }
+
+          def fetch_current_price():
+              url = 'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd'
+              req = Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+              data = json.loads(urlopen(req, timeout=10).read())
+              return float(data['bitcoin']['usd'])
+
+          def invoke_model(endpoint, features):
+              try:
+                  resp   = sm_runtime.invoke_endpoint(
+                      EndpointName=endpoint, ContentType='application/json',
+                      Accept='application/json', Body=json.dumps(features))
+                  result = json.loads(resp['Body'].read())
+                  return float(result.get('prediction') or result.get('price_24h') or 0)
+              except Exception as e:
+                  print(f"  {endpoint} failed: {e}")
+                  return None
+
+          def weighted_average(values, weights):
+              total = sum(w for v, w in zip(values, weights) if v is not None)
+              if total == 0: return None
+              return sum(v * w for v, w in zip(values, weights) if v is not None) / total
+
+          def lambda_handler(event, context):
+              date = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+              print(f"[FINAL CHECK] {date} 23:00 GMT")
+
+              # ── 1. Fresh current price ────────────────────────────────────
+              try:
+                  current_price = fetch_current_price()
+                  print(f"  Current BTC: ${current_price:,.0f}")
+              except Exception as e:
+                  print(f"  CoinGecko failed: {e}")
+                  current_price = None
+
+              # ── 2. Load today's evening features (fallback: morning) ───────
+              features = None
+              for run in ['evening', 'morning']:
+                  try:
+                      obj      = s3.get_object(Bucket=BUCKET, Key=f'features/{date}/{run}.json')
+                      features = json.loads(obj['Body'].read())
+                      if current_price:
+                          features['current_price'] = current_price
+                      print(f"  Features: {date}/{run}.json")
+                      break
+                  except Exception:
+                      pass
+
+              if not features:
+                  sns.publish(TopicArn=SNS_ARN,
+                              Subject='⚠️ Final Check Failed — No Features',
+                              Message=f'No features found for {date}. Pipeline may not have run today.')
+                  return {'statusCode': 500, 'error': 'no features'}
+
+              # ── 3. Invoke all 4 models ─────────────────────────────────────
+              preds = {m: invoke_model(ENDPOINTS[m], features) for m in MODEL_NAMES}
+              for m, p in preds.items():
+                  print(f"  {LABELS[m]}: {'$'+f'{p:,.0f}' if p else 'FAILED'}")
+
+              # ── 4. Load dynamic weights (fallback: equal) ─────────────────
+              try:
+                  w_obj  = s3.get_object(Bucket=BUCKET, Key='config/model_weights.json')
+                  w_data = json.loads(w_obj['Body'].read())
+                  if w_data.get('sample_size', 0) >= 7:
+                      dyn     = w_data['weights']
+                      weights = [dyn.get(m, 0.25) for m in MODEL_NAMES]
+                      w_note  = f"performance-weighted (n={w_data['sample_size']})"
+                  else:
+                      weights = [0.25] * 4
+                      w_note  = 'equal (< 7 days data)'
+              except Exception:
+                  weights = [0.25] * 4
+                  w_note  = 'equal (default)'
+
+              # ── 5. Standalone blend ───────────────────────────────────────
+              blended = weighted_average([preds[m] for m in MODEL_NAMES], weights)
+              if blended is None:
+                  sns.publish(TopicArn=SNS_ARN,
+                              Subject='⚠️ Final Check — All Models Failed',
+                              Message='All 4 endpoints failed. Check SageMaker console.')
+                  return {'statusCode': 500, 'error': 'all models failed'}
+
+              BTC_FLOOR, BTC_CEILING = 15_000, 600_000
+              if not (BTC_FLOOR <= blended <= BTC_CEILING):
+                  sns.publish(TopicArn=SNS_ARN,
+                              Subject='🚨 Final Check — Hallucination Guard',
+                              Message=f'Blended prediction ${blended:,.0f} outside safe range. Do not submit.')
+                  return {'statusCode': 500, 'error': 'hallucination guard'}
+
+              # ── 6. Build email ────────────────────────────────────────────
+              change_pct = ((blended - current_price) / current_price * 100) if current_price else 0
+              direction  = '▲' if change_pct > 0 else '▼'
+              price_line = f"Current BTC:            ${current_price:,.0f}\n" if current_price else ''
+
+              live = [preds[m] for m in MODEL_NAMES if preds[m]]
+              spread = max(live) - min(live) if len(live) >= 2 else 0
+              spread_note = f"\n⚠️ High model spread: ${spread:,.0f} — models disagree, use judgement.\n" if spread > 5_000 else ''
+
+              model_rows = '\n'.join(
+                  f"  {'$'+f'{preds[m]:,.0f}' if preds[m] else 'FAILED':<14}  {LABELS[m]}"
+                  for m in MODEL_NAMES
+              )
+
+              message = (
+                  f"🔍 FINAL CHECK — {date}\n"
+                  f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                  f"RECOMMENDED SUBMISSION: ${blended:,.0f}\n"
+                  f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                  f"{price_line}"
+                  f"Standalone prediction:  ${blended:,.0f}  {direction} {abs(change_pct):.1f}%\n"
+                  f"Weights:                {w_note}\n"
+                  f"{spread_note}\n"
+                  f"All 4 models right now:\n{model_rows}\n\n"
+                  f"⏰ 1 hour to midnight — submit at rainface.finance\n"
+                  f"Good luck! 🎯"
+              )
+              subject = (f"🔍 Final Check {date} — Submit ${blended:,.0f}  "
+                         f"{direction}{abs(change_pct):.1f}%")
+
+              sns.publish(TopicArn=SNS_ARN, Subject=subject, Message=message)
+              print(f"  Email sent. Blended: ${blended:,.0f} ({direction}{abs(change_pct):.1f}%)")
+
+              return {
+                  'statusCode':   200,
+                  'date':         date,
+                  'current_price': current_price,
+                  'blended':      round(blended, 2),
+                  'predictions':  {m: preds[m] for m in MODEL_NAMES},
+              }
+
+  FinalCheckRule:
     Type: AWS::Events::Rule
     Properties:
-      Name: !Sub 'bitcoin-submission-reminder-${Environment}'
-      Description: '23:30 GMT submission reminder — 30 mins before midnight Rainface deadline'
-      ScheduleExpression: 'cron(30 23 * * ? *)'
+      Name: !Sub 'bitcoin-final-check-${Environment}'
+      Description: '23:00 GMT — standalone final check before midnight submission'
+      ScheduleExpression: 'cron(0 23 * * ? *)'
       State: ENABLED
       Targets:
-        - Id: SubmissionSNS
-          Arn: !Ref AlertTopic
-          Input: !Sub |
-            {
-              "default": "⏰ SUBMIT NOW — 30 minutes to midnight.\nGo to rainface.finance, check your evening prediction in DynamoDB table bitcoin-predictions-${Environment}, and submit the final_prediction value before midnight BST.",
-              "email": "⏰ SUBMIT NOW — 30 minutes to midnight.\n\nGo to rainface.finance and submit your Bitcoin prediction before midnight BST.\n\nCheck DynamoDB table: bitcoin-predictions-${Environment}\nLook for today's date, run_type = evening, field = final_prediction.\n\nGood luck! 🎯"
-            }
+        - Id: FinalCheckLambda
+          Arn: !GetAtt FinalCheckFunction.Arn
 
-  SubmissionReminderSNSPermission:
-    Type: AWS::SNS::TopicPolicy
+  FinalCheckPermission:
+    Type: AWS::Lambda::Permission
     Properties:
-      Topics:
-        - !Ref AlertTopic
-      PolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Sid: AllowEventBridgePublish
-            Effect: Allow
-            Principal:
-              Service: events.amazonaws.com
-            Action: sns:Publish
-            Resource: !Ref AlertTopic
+      FunctionName: !GetAtt FinalCheckFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt FinalCheckRule.Arn
 
   # ═══════════════════════════════════════════════════════════════════════════
   # WEEKLY RETRAINING — refreshes training data + all models every Sunday 02:00 UTC
