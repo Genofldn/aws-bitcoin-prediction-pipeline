@@ -976,12 +976,33 @@ Resources:
               sentiment_pred    = invoke_model(os.environ['SENTIMENT_ENDPOINT'], features)
               timeseries_pred   = invoke_model(os.environ['TIMESERIES_ENDPOINT'], features)
 
-              model_weights = [
+              # ── Load model weights (dynamic from S3, fallback to env var defaults) ─
+              default_weights = [
                   float(os.environ['ENSEMBLE_MODEL_WEIGHT']),
                   float(os.environ['DEEPLEARNING_MODEL_WEIGHT']),
                   float(os.environ['SENTIMENT_MODEL_WEIGHT']),
                   float(os.environ['TIMESERIES_MODEL_WEIGHT']),
               ]
+              weights_used = 'default'
+              try:
+                  w_obj  = s3.get_object(Bucket=bucket, Key='config/model_weights.json')
+                  w_data = json.loads(w_obj['Body'].read())
+                  if w_data.get('sample_size', 0) >= 7:
+                      dyn = w_data['weights']
+                      model_weights = [
+                          dyn.get('ensemble',     default_weights[0]),
+                          dyn.get('deeplearning', default_weights[1]),
+                          dyn.get('sentiment',    default_weights[2]),
+                          dyn.get('timeseries',   default_weights[3]),
+                      ]
+                      weights_used = f"dynamic (n={w_data['sample_size']})"
+                  else:
+                      model_weights = default_weights
+              except Exception:
+                  model_weights = default_weights
+              print(f"  Weights ({weights_used}): ensemble={model_weights[0]:.2f} "
+                    f"dl={model_weights[1]:.2f} sentiment={model_weights[2]:.2f} "
+                    f"ts={model_weights[3]:.2f}")
               model_predictions = [ensemble_pred, deeplearning_pred, sentiment_pred, timeseries_pred]
 
               # Weighted average across models (drops any that failed)
@@ -1060,8 +1081,8 @@ Resources:
                       f"  • Deep Learning (LSTM):  {dl_s}\n"
                       f"  • Sentiment (BERT):       {sent_s}\n"
                       f"  • Time Series (ARIMA):   {ts_s}\n\n"
-                      f"Evening run at 21:00 BST will refine this.\n"
-                      f"Final prediction due by 23:55 BST."
+                      f"Evening pipeline at 22:30 GMT will refine this.\n"
+                      f"Reminder email at 23:30 GMT — submit before midnight."
                   )
 
               # ── Evening run: apply 30/70 morning/evening weighting ────────
@@ -2110,15 +2131,11 @@ Resources:
       Code:
         ZipFile: |
           """
-          Daily accuracy tracker — with directional accuracy.
-          Fires at 07:30 UTC. Reads yesterday's final_prediction + current_price from DynamoDB,
-          fetches the current BTC price as "actual" (≈24h after evening prediction),
-          stores error + directional accuracy to S3, builds 7-day rolling summary, sends email.
-
-          Directional accuracy = did we correctly call UP or DOWN vs price at prediction time?
-            predicted_dir = 'up' if final_prediction > current_price_at_pred else 'down'
-            actual_dir    = 'up' if actual_now       > current_price_at_pred else 'down'
-            direction_correct = (predicted_dir == actual_dir)
+          Daily accuracy tracker — per-model accuracy + dynamic weight updates.
+          Fires at 07:30 GMT. Reads yesterday's predictions from DynamoDB,
+          fetches actual BTC price, stores per-model errors to S3.
+          After 7 days of data: computes inverse-MAE weights, saves to
+          config/model_weights.json — picked up by orchestrator on next run.
           """
           import json, os, boto3
           from datetime import datetime, timezone, timedelta
@@ -2133,6 +2150,13 @@ Resources:
           dynamo = boto3.resource('dynamodb', region_name=REGION)
           sns    = boto3.client('sns',        region_name=REGION)
 
+          MODEL_NAMES  = ['ensemble', 'deeplearning', 'sentiment', 'timeseries']
+          MODEL_LABELS = {'ensemble': 'Ensemble', 'deeplearning': 'LSTM',
+                          'sentiment': 'Sentiment', 'timeseries': 'TimeSeries'}
+          WEIGHT_KEY   = 'config/model_weights.json'
+          WEIGHT_FLOOR = 0.05   # no model gets less than 5%
+          MIN_DAYS     = 7      # days of data before dynamic weights activate
+
           def fetch_current_price():
               url = 'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd'
               req = Request(url, headers={'User-Agent': 'Mozilla/5.0'})
@@ -2142,7 +2166,7 @@ Resources:
           def load_accuracy_records(n=7):
               records = []
               today = datetime.now(timezone.utc).date()
-              for i in range(1, n + 8):   # look back extra days in case some are missing
+              for i in range(1, n + 8):
                   d = (today - timedelta(days=i)).isoformat()
                   try:
                       obj = s3.get_object(Bucket=BUCKET, Key=f'accuracy/{d}.json')
@@ -2151,13 +2175,52 @@ Resources:
                       pass
                   if len(records) >= n:
                       break
-              return sorted(records, key=lambda r: r['date'])  # oldest first
+              return sorted(records, key=lambda r: r['date'])
+
+          def compute_dynamic_weights(history):
+              """Inverse-MAE weighting with 5% floor and 70/30 smoothing."""
+              model_maes = {m: [] for m in MODEL_NAMES}
+              for r in history:
+                  for m in MODEL_NAMES:
+                      me = r.get('model_errors', {}).get(m)
+                      if me and me.get('error_pct') is not None:
+                          model_maes[m].append(me['error_pct'])
+
+              valid = {m: model_maes[m] for m in MODEL_NAMES if len(model_maes[m]) >= MIN_DAYS}
+              if len(valid) < len(MODEL_NAMES):
+                  return None, {m: (sum(v)/len(v) if v else None) for m, v in model_maes.items()}
+
+              avg_mae = {m: sum(v) / len(v) for m, v in valid.items()}
+              inv  = {m: 1.0 / avg_mae[m] for m in MODEL_NAMES if avg_mae[m] > 0}
+              tot  = sum(inv.values())
+              new_w = {m: inv[m] / tot for m in MODEL_NAMES}
+
+              # Floor
+              for m in MODEL_NAMES:
+                  new_w[m] = max(new_w[m], WEIGHT_FLOOR)
+              tot = sum(new_w.values())
+              new_w = {m: v / tot for m, v in new_w.items()}
+
+              # Smooth with previous weights (70% new, 30% old)
+              try:
+                  prev_obj  = s3.get_object(Bucket=BUCKET, Key=WEIGHT_KEY)
+                  prev_data = json.loads(prev_obj['Body'].read())
+                  prev_w    = prev_data.get('weights', {})
+                  if prev_w:
+                      for m in MODEL_NAMES:
+                          new_w[m] = 0.7 * new_w[m] + 0.3 * prev_w.get(m, new_w[m])
+                      tot   = sum(new_w.values())
+                      new_w = {m: v / tot for m, v in new_w.items()}
+              except Exception:
+                  pass
+
+              return new_w, avg_mae
 
           def lambda_handler(event, context):
               today     = datetime.now(timezone.utc).date()
               yesterday = (today - timedelta(days=1)).isoformat()
 
-              # ── 1. Read yesterday's final prediction from DynamoDB ───────────
+              # ── 1. Read yesterday's prediction from DynamoDB ─────────────────
               table  = dynamo.Table(TABLE)
               record = None
               for run in ['evening', 'morning']:
@@ -2168,13 +2231,22 @@ Resources:
                       break
 
               if record is None:
-                  print(f"No prediction record for {yesterday} — skipping accuracy check")
+                  print(f"No prediction record for {yesterday} — skipping")
                   return {'statusCode': 200, 'skipped': True}
 
-              predicted      = float(record.get('final_prediction') or record.get('prediction'))
-              price_at_pred  = float(record['current_price']) if record.get('current_price') else None
+              predicted     = float(record.get('final_prediction') or record.get('prediction'))
+              price_at_pred = float(record['current_price']) if record.get('current_price') else None
 
-              # ── 2. Fetch actual current price ────────────────────────────────
+              # Extract per-model predictions from DynamoDB map
+              raw_mp = record.get('model_predictions', {})
+              model_preds = {}
+              for m in MODEL_NAMES:
+                  v = raw_mp.get(m)
+                  if v is not None:
+                      try: model_preds[m] = float(v)
+                      except Exception: pass
+
+              # ── 2. Fetch actual price ─────────────────────────────────────────
               try:
                   actual = fetch_current_price()
               except Exception as e:
@@ -2184,21 +2256,32 @@ Resources:
               error_usd = actual - predicted
               error_pct = abs(error_usd) / actual * 100
 
-              # ── 3. Directional accuracy ──────────────────────────────────────
+              # ── 3. Per-model errors ───────────────────────────────────────────
+              model_errors = {}
+              for m in MODEL_NAMES:
+                  if m in model_preds:
+                      m_err_usd = actual - model_preds[m]
+                      m_err_pct = abs(m_err_usd) / actual * 100
+                      model_errors[m] = {
+                          'predicted': round(model_preds[m], 2),
+                          'error_usd': round(m_err_usd, 2),
+                          'error_pct': round(m_err_pct, 2),
+                      }
+
+              # ── 4. Directional accuracy ───────────────────────────────────────
               direction_correct = None
-              predicted_dir     = None
-              actual_dir        = None
-              dir_emoji         = ''
+              predicted_dir = actual_dir = None
+              dir_emoji = ''
               if price_at_pred:
                   predicted_dir     = 'up' if predicted > price_at_pred else 'down'
                   actual_dir        = 'up' if actual    > price_at_pred else 'down'
                   direction_correct = (predicted_dir == actual_dir)
                   dir_emoji         = '✅' if direction_correct else '❌'
-                  print(f"  Direction: predicted {predicted_dir}, actual {actual_dir} → {dir_emoji}")
-              else:
-                  print("  Direction: current_price not in DynamoDB record — skipping directional check")
+              print(f"Accuracy {yesterday}: blend={error_pct:.1f}% dir={dir_emoji or 'N/A'}")
+              for m, e in model_errors.items():
+                  print(f"  {MODEL_LABELS[m]}: {e['error_pct']:.1f}%")
 
-              # ── 4. Store accuracy record to S3 ───────────────────────────────
+              # ── 5. Store accuracy record ──────────────────────────────────────
               acc_record = {
                   'date':              yesterday,
                   'predicted':         round(predicted, 2),
@@ -2210,20 +2293,38 @@ Resources:
                   'predicted_dir':     predicted_dir,
                   'actual_dir':        actual_dir,
                   'direction_correct': direction_correct,
+                  'model_errors':      model_errors,
                   'checked_at':        datetime.now(timezone.utc).isoformat(),
               }
-              s3.put_object(
-                  Bucket=BUCKET,
-                  Key=f'accuracy/{yesterday}.json',
-                  Body=json.dumps(acc_record),
-                  ContentType='application/json'
-              )
-              print(f"Accuracy {yesterday}: predicted=${predicted:,.0f} actual=${actual:,.0f} "
-                    f"error={error_pct:.1f}% direction={dir_emoji or 'N/A'}")
+              s3.put_object(Bucket=BUCKET, Key=f'accuracy/{yesterday}.json',
+                            Body=json.dumps(acc_record), ContentType='application/json')
 
-              # ── 5. Build 7-day rolling summary ───────────────────────────────
+              # ── 6. 7-day summary + dynamic weight update ──────────────────────
               history = load_accuracy_records(n=7)
+              weights_updated = False
+              weight_note = ''
 
+              if len(history) >= MIN_DAYS:
+                  new_weights, mae_7d = compute_dynamic_weights(history)
+                  if new_weights:
+                      s3.put_object(
+                          Bucket=BUCKET, Key=WEIGHT_KEY,
+                          Body=json.dumps({
+                              'weights':      new_weights,
+                              'sample_size':  len(history),
+                              'model_mae_7d': {m: round(v, 2) for m, v in mae_7d.items() if v},
+                              'updated_at':   datetime.now(timezone.utc).isoformat(),
+                          }),
+                          ContentType='application/json'
+                      )
+                      weights_updated = True
+                      weight_note = '\n🔄 Model weights auto-updated:\n' + '\n'.join(
+                          f"  {MODEL_LABELS[m]:<12}: {new_weights[m]:.2f}  (7d MAE {mae_7d[m]:.1f}%)"
+                          for m in MODEL_NAMES
+                      ) + '\n'
+                      print(f"  Weights saved: {new_weights}")
+
+              # ── 7. Build email ────────────────────────────────────────────────
               if history:
                   avg_err     = sum(r['error_pct'] for r in history) / len(history)
                   best        = min(history, key=lambda r: r['error_pct'])
@@ -2231,60 +2332,70 @@ Resources:
                   over_count  = sum(1 for r in history if r['direction'] == 'above')
                   under_count = len(history) - over_count
 
-                  # Directional accuracy stats (only days that have current_price)
-                  dir_records  = [r for r in history if r.get('direction_correct') is not None]
-                  dir_correct  = sum(1 for r in dir_records if r['direction_correct'])
-                  dir_total    = len(dir_records)
-                  dir_pct      = dir_correct / dir_total * 100 if dir_total > 0 else None
+                  dir_recs   = [r for r in history if r.get('direction_correct') is not None]
+                  dir_correct = sum(1 for r in dir_recs if r['direction_correct'])
+                  dir_total   = len(dir_recs)
+                  dir_pct     = dir_correct / dir_total * 100 if dir_total > 0 else None
 
-                  rows = '\n'.join(
+                  # Per-model MAE table
+                  model_rows = []
+                  for m in MODEL_NAMES:
+                      errs = [r['model_errors'][m]['error_pct']
+                              for r in history if r.get('model_errors', {}).get(m)]
+                      if errs:
+                          model_rows.append(
+                              f"  {MODEL_LABELS[m]:<12} {sum(errs)/len(errs):.1f}%  (n={len(errs)})")
+
+                  history_rows = '\n'.join(
                       f"  {r['date']}  pred ${r['predicted']:>9,.0f}  "
                       f"actual ${r['actual']:>9,.0f}  "
                       f"{'▲' if r['direction']=='above' else '▼'} {r['error_pct']:.1f}%"
-                      + (f"  {'✅' if r['direction_correct'] else '❌'}" if r.get('direction_correct') is not None else '  —')
+                      + (f"  {'✅' if r['direction_correct'] else '❌'}"
+                         if r.get('direction_correct') is not None else '  —')
                       for r in history
                   )
 
                   trend_emoji = '📈' if avg_err <= 3.0 else '📉' if avg_err >= 6.0 else '➡️'
-
-                  if dir_pct is not None:
-                      dir_grade = '🎯 Strong' if dir_pct >= 65 else ('⚠️ Weak' if dir_pct < 50 else '➡️ Moderate')
-                      dir_line  = f"  Directional accuracy: {dir_correct}/{dir_total} ({dir_pct:.0f}%) — {dir_grade}\n"
-                  else:
-                      dir_line  = "  Directional accuracy: building (need current_price in records)\n"
+                  dir_grade   = ('🎯 Strong' if dir_pct and dir_pct >= 65
+                                 else '⚠️ Weak' if dir_pct and dir_pct < 50 else '➡️ Moderate')
+                  dir_line    = (f"  Directional: {dir_correct}/{dir_total} ({dir_pct:.0f}%) — {dir_grade}\n"
+                                 if dir_pct is not None else '')
+                  model_section = ('\nPer-model 7d MAE:\n' + '\n'.join(model_rows) + '\n') if model_rows else ''
 
                   message = (
                       f"📋 DAILY ACCURACY REPORT — {yesterday}\n"
                       f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                       f"Yesterday:  predicted ${predicted:,.0f}  →  actual ${actual:,.0f}\n"
-                      f"Error: {'▲' if predicted > actual else '▼'} ${abs(error_usd):,.0f} ({error_pct:.1f}%)"
-                      + (f"  direction {dir_emoji}" if dir_emoji else '') + "\n\n"
+                      f"Error: {'▲' if predicted > actual else '▼'} ${abs(error_usd):,.0f} "
+                      f"({error_pct:.1f}%)" + (f"  {dir_emoji}" if dir_emoji else '') + "\n\n"
                       f"7-Day Rolling Performance {trend_emoji}\n"
-                      f"  Average MAE:    {avg_err:.1f}%\n"
-                      + dir_line +
-                      f"  Predicted high: {over_count}x  |  Predicted low: {under_count}x\n"
-                      f"  Best day:  {best['date']} ({best['error_pct']:.1f}% off)\n"
-                      f"  Worst day: {worst['date']} ({worst['error_pct']:.1f}% off)\n\n"
-                      f"History (▲/▼ = predicted vs actual price, ✅/❌ = direction correct):\n"
-                      f"{rows}\n\n"
-                      f"(Morning pipeline runs at 08:00 BST with today's prediction.)"
+                      f"  Average MAE:  {avg_err:.1f}%\n"
+                      + dir_line
+                      + f"  Predicted high: {over_count}x  |  Predicted low: {under_count}x\n"
+                      f"  Best day:   {best['date']} ({best['error_pct']:.1f}% off)\n"
+                      f"  Worst day:  {worst['date']} ({worst['error_pct']:.1f}% off)\n"
+                      + model_section + weight_note + "\n"
+                      f"History (▲/▼ vs actual, ✅/❌ direction):\n{history_rows}\n\n"
+                      f"(Evening pipeline 22:30 GMT · Reminder 23:30 GMT)"
                   )
-
                   subject_dir = f"{dir_pct:.0f}% dir" if dir_pct is not None else "dir N/A"
                   subject = f"📋 Bitcoin Accuracy — {error_pct:.1f}% MAE | {subject_dir}"
               else:
-                  dir_note = f"Direction: {dir_emoji} ({'correct' if direction_correct else 'wrong'})\n" if dir_emoji else ''
+                  model_section = ''
+                  if model_errors:
+                      model_section = 'Per-model errors:\n' + '\n'.join(
+                          f"  {MODEL_LABELS[m]}: ${abs(e['error_usd']):,.0f} ({e['error_pct']:.1f}%)"
+                          for m, e in model_errors.items()) + '\n'
+                  dir_note = f"Direction: {dir_emoji}\n" if dir_emoji else ''
                   message = (
                       f"📋 ACCURACY REPORT — {yesterday}\n"
                       f"Predicted: ${predicted:,.0f}  Actual: ${actual:,.0f}\n"
-                      f"Error: {error_pct:.1f}% ({'above' if predicted > actual else 'below'})\n"
-                      + dir_note +
-                      f"\n7-day history will build up over the coming week."
+                      f"Error: {error_pct:.1f}%\n" + dir_note + model_section +
+                      f"\nDynamic weights activate after {MIN_DAYS} days of data."
                   )
-                  subject = f"📋 Bitcoin Accuracy Report — {error_pct:.1f}% error yesterday"
+                  subject = f"📋 Bitcoin Accuracy — {error_pct:.1f}% error yesterday"
 
               sns.publish(TopicArn=SNS_ARN, Subject=subject, Message=message)
-
               return {
                   'statusCode':        200,
                   'date':              yesterday,
@@ -2292,6 +2403,8 @@ Resources:
                   'actual':            actual,
                   'error_pct':         round(error_pct, 2),
                   'direction_correct': direction_correct,
+                  'model_errors':      {m: e['error_pct'] for m, e in model_errors.items()},
+                  'weights_updated':   weights_updated,
               }
 
   AccuracyTrackerPermission:
