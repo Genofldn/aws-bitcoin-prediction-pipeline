@@ -1263,10 +1263,10 @@ Resources:
 
   # ═══════════════════════════════════════════════════════════════════════════
   # EVENTBRIDGE SCHEDULES
-  # All times in UTC. UK uses BST (UTC+1) in summer.
-  # Morning:  07:00 UTC = 08:00 BST
-  # Evening:  20:00 UTC = 21:00 BST
-  # Reminder: 22:30 UTC = 23:30 BST  (30 mins before midnight deadline)
+  # All times in GMT.
+  # Morning:  07:00 GMT
+  # Evening:  22:30 GMT  (freshest data, ~1h before reminder)
+  # Reminder: 23:30 GMT  (submit before midnight)
   # ═══════════════════════════════════════════════════════════════════════════
 
   MorningPipelineRule:
@@ -1285,22 +1285,22 @@ Resources:
     Type: AWS::Events::Rule
     Properties:
       Name: !Sub 'bitcoin-evening-pipeline-${Environment}'
-      Description: 'Triggers the evening prediction pipeline at 21:00 BST (20:00 UTC)'
-      ScheduleExpression: 'cron(0 20 * * ? *)'
+      Description: 'Triggers the evening prediction pipeline at 22:30 GMT (freshest data before submission)'
+      ScheduleExpression: 'cron(30 22 * * ? *)'
       State: ENABLED
       Targets:
         - Id: EveningCoordinator
           Arn: !GetAtt PipelineCoordinatorFunction.Arn
           Input: !Sub '{"run_type": "evening"}'
 
-  # 23:30 BST reminder — SNS fires directly (no Lambda needed).
+  # 23:30 GMT reminder — SNS fires directly (no Lambda needed).
   # Reminds you to go to rainface.finance and submit tonight's prediction.
   SubmissionReminderRule:
     Type: AWS::Events::Rule
     Properties:
       Name: !Sub 'bitcoin-submission-reminder-${Environment}'
-      Description: '23:30 BST submission reminder — 30 mins before midnight Rainface deadline'
-      ScheduleExpression: 'cron(30 22 * * ? *)'
+      Description: '23:30 GMT submission reminder — 30 mins before midnight Rainface deadline'
+      ScheduleExpression: 'cron(30 23 * * ? *)'
       State: ENABLED
       Targets:
         - Id: SubmissionSNS
