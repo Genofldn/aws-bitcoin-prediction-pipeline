@@ -2110,10 +2110,15 @@ Resources:
       Code:
         ZipFile: |
           """
-          Daily accuracy tracker.
-          Fires at 07:30 UTC. Reads yesterday's final_prediction from DynamoDB,
+          Daily accuracy tracker — with directional accuracy.
+          Fires at 07:30 UTC. Reads yesterday's final_prediction + current_price from DynamoDB,
           fetches the current BTC price as "actual" (≈24h after evening prediction),
-          stores error to S3, builds 7-day rolling summary, sends email.
+          stores error + directional accuracy to S3, builds 7-day rolling summary, sends email.
+
+          Directional accuracy = did we correctly call UP or DOWN vs price at prediction time?
+            predicted_dir = 'up' if final_prediction > current_price_at_pred else 'down'
+            actual_dir    = 'up' if actual_now       > current_price_at_pred else 'down'
+            direction_correct = (predicted_dir == actual_dir)
           """
           import json, os, boto3
           from datetime import datetime, timezone, timedelta
@@ -2166,7 +2171,8 @@ Resources:
                   print(f"No prediction record for {yesterday} — skipping accuracy check")
                   return {'statusCode': 200, 'skipped': True}
 
-              predicted = float(record.get('final_prediction') or record.get('prediction'))
+              predicted      = float(record.get('final_prediction') or record.get('prediction'))
+              price_at_pred  = float(record['current_price']) if record.get('current_price') else None
 
               # ── 2. Fetch actual current price ────────────────────────────────
               try:
@@ -2178,15 +2184,33 @@ Resources:
               error_usd = actual - predicted
               error_pct = abs(error_usd) / actual * 100
 
-              # ── 3. Store accuracy record to S3 ───────────────────────────────
+              # ── 3. Directional accuracy ──────────────────────────────────────
+              direction_correct = None
+              predicted_dir     = None
+              actual_dir        = None
+              dir_emoji         = ''
+              if price_at_pred:
+                  predicted_dir     = 'up' if predicted > price_at_pred else 'down'
+                  actual_dir        = 'up' if actual    > price_at_pred else 'down'
+                  direction_correct = (predicted_dir == actual_dir)
+                  dir_emoji         = '✅' if direction_correct else '❌'
+                  print(f"  Direction: predicted {predicted_dir}, actual {actual_dir} → {dir_emoji}")
+              else:
+                  print("  Direction: current_price not in DynamoDB record — skipping directional check")
+
+              # ── 4. Store accuracy record to S3 ───────────────────────────────
               acc_record = {
-                  'date':         yesterday,
-                  'predicted':    round(predicted, 2),
-                  'actual':       round(actual, 2),
-                  'error_usd':    round(error_usd, 2),
-                  'error_pct':    round(error_pct, 2),
-                  'direction':    'above' if predicted > actual else 'below',
-                  'checked_at':   datetime.now(timezone.utc).isoformat(),
+                  'date':              yesterday,
+                  'predicted':         round(predicted, 2),
+                  'actual':            round(actual, 2),
+                  'current_price':     round(price_at_pred, 2) if price_at_pred else None,
+                  'error_usd':         round(error_usd, 2),
+                  'error_pct':         round(error_pct, 2),
+                  'direction':         'above' if predicted > actual else 'below',
+                  'predicted_dir':     predicted_dir,
+                  'actual_dir':        actual_dir,
+                  'direction_correct': direction_correct,
+                  'checked_at':        datetime.now(timezone.utc).isoformat(),
               }
               s3.put_object(
                   Bucket=BUCKET,
@@ -2195,60 +2219,79 @@ Resources:
                   ContentType='application/json'
               )
               print(f"Accuracy {yesterday}: predicted=${predicted:,.0f} actual=${actual:,.0f} "
-                    f"error={error_pct:.1f}%")
+                    f"error={error_pct:.1f}% direction={dir_emoji or 'N/A'}")
 
-              # ── 4. Build 7-day rolling summary ───────────────────────────────
+              # ── 5. Build 7-day rolling summary ───────────────────────────────
               history = load_accuracy_records(n=7)
 
               if history:
-                  avg_err    = sum(r['error_pct'] for r in history) / len(history)
-                  best       = min(history, key=lambda r: r['error_pct'])
-                  worst      = max(history, key=lambda r: r['error_pct'])
-                  over_count = sum(1 for r in history if r['direction'] == 'above')
-                  under_count= len(history) - over_count
+                  avg_err     = sum(r['error_pct'] for r in history) / len(history)
+                  best        = min(history, key=lambda r: r['error_pct'])
+                  worst       = max(history, key=lambda r: r['error_pct'])
+                  over_count  = sum(1 for r in history if r['direction'] == 'above')
+                  under_count = len(history) - over_count
+
+                  # Directional accuracy stats (only days that have current_price)
+                  dir_records  = [r for r in history if r.get('direction_correct') is not None]
+                  dir_correct  = sum(1 for r in dir_records if r['direction_correct'])
+                  dir_total    = len(dir_records)
+                  dir_pct      = dir_correct / dir_total * 100 if dir_total > 0 else None
 
                   rows = '\n'.join(
-                      f"  {r['date']}  predicted ${r['predicted']:>9,.0f}  "
+                      f"  {r['date']}  pred ${r['predicted']:>9,.0f}  "
                       f"actual ${r['actual']:>9,.0f}  "
-                      f"{'▲' if r['direction']=='above' else '▼'} "
-                      f"{r['error_pct']:.1f}%"
+                      f"{'▲' if r['direction']=='above' else '▼'} {r['error_pct']:.1f}%"
+                      + (f"  {'✅' if r['direction_correct'] else '❌'}" if r.get('direction_correct') is not None else '  —')
                       for r in history
                   )
 
                   trend_emoji = '📈' if avg_err <= 3.0 else '📉' if avg_err >= 6.0 else '➡️'
+
+                  if dir_pct is not None:
+                      dir_grade = '🎯 Strong' if dir_pct >= 65 else ('⚠️ Weak' if dir_pct < 50 else '➡️ Moderate')
+                      dir_line  = f"  Directional accuracy: {dir_correct}/{dir_total} ({dir_pct:.0f}%) — {dir_grade}\n"
+                  else:
+                      dir_line  = "  Directional accuracy: building (need current_price in records)\n"
+
                   message = (
                       f"📋 DAILY ACCURACY REPORT — {yesterday}\n"
                       f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                       f"Yesterday:  predicted ${predicted:,.0f}  →  actual ${actual:,.0f}\n"
-                      f"Error: {'▲' if predicted > actual else '▼'} ${abs(error_usd):,.0f} ({error_pct:.1f}%)\n\n"
+                      f"Error: {'▲' if predicted > actual else '▼'} ${abs(error_usd):,.0f} ({error_pct:.1f}%)"
+                      + (f"  direction {dir_emoji}" if dir_emoji else '') + "\n\n"
                       f"7-Day Rolling Performance {trend_emoji}\n"
-                      f"  Average error:  {avg_err:.1f}%\n"
+                      f"  Average MAE:    {avg_err:.1f}%\n"
+                      + dir_line +
                       f"  Predicted high: {over_count}x  |  Predicted low: {under_count}x\n"
                       f"  Best day:  {best['date']} ({best['error_pct']:.1f}% off)\n"
                       f"  Worst day: {worst['date']} ({worst['error_pct']:.1f}% off)\n\n"
-                      f"History:\n{rows}\n\n"
+                      f"History (▲/▼ = predicted vs actual price, ✅/❌ = direction correct):\n"
+                      f"{rows}\n\n"
                       f"(Morning pipeline runs at 08:00 BST with today's prediction.)"
                   )
+
+                  subject_dir = f"{dir_pct:.0f}% dir" if dir_pct is not None else "dir N/A"
+                  subject = f"📋 Bitcoin Accuracy — {error_pct:.1f}% MAE | {subject_dir}"
               else:
+                  dir_note = f"Direction: {dir_emoji} ({'correct' if direction_correct else 'wrong'})\n" if dir_emoji else ''
                   message = (
                       f"📋 ACCURACY REPORT — {yesterday}\n"
                       f"Predicted: ${predicted:,.0f}  Actual: ${actual:,.0f}\n"
-                      f"Error: {error_pct:.1f}% ({'above' if predicted > actual else 'below'})\n\n"
-                      f"7-day history will build up over the coming week."
+                      f"Error: {error_pct:.1f}% ({'above' if predicted > actual else 'below'})\n"
+                      + dir_note +
+                      f"\n7-day history will build up over the coming week."
                   )
+                  subject = f"📋 Bitcoin Accuracy Report — {error_pct:.1f}% error yesterday"
 
-              sns.publish(
-                  TopicArn=SNS_ARN,
-                  Subject=f'📋 Bitcoin Accuracy Report — {error_pct:.1f}% error yesterday',
-                  Message=message
-              )
+              sns.publish(TopicArn=SNS_ARN, Subject=subject, Message=message)
 
               return {
-                  'statusCode':   200,
-                  'date':         yesterday,
-                  'predicted':    predicted,
-                  'actual':       actual,
-                  'error_pct':    round(error_pct, 2),
+                  'statusCode':        200,
+                  'date':              yesterday,
+                  'predicted':         predicted,
+                  'actual':            actual,
+                  'error_pct':         round(error_pct, 2),
+                  'direction_correct': direction_correct,
               }
 
   AccuracyTrackerPermission:
